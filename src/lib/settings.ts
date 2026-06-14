@@ -8,6 +8,7 @@ export const SETTING_KEYS = [
   // ── Required API keys ─────────────────────────────────────────────
   "GOOGLE_API_KEY",          // Gemini — scene splitting
   "PEXELS_API_KEY",          // Pexels — stock b-roll
+  "PIXABAY_API_KEY",         // Pixabay — second stock source (video+photo, no attribution). Optional; empty = Pexels only.
   "AI33PRO_API_KEY",         // ai33.pro — ElevenLabs voices proxy
   "GROQ_API_KEY",            // Groq Whisper — word-level transcription for single-shot voiceover mode
 
@@ -32,8 +33,10 @@ export const SETTING_KEYS = [
   "MIN_SCENE_SECONDS",       // single-shot: minimum seconds a visual stays on screen. Scenes shorter than this are merged with the next (keeping the first scene's footage) so the picture doesn't flip every 1-2s.
   "MAX_PAUSE_SECONDS",       // single-shot: cap every silence in the continuous voiceover to this many seconds (tames over-long pauses between sentences / at chunk seams). 0 = off.
 
-  // ── Stock footage (Pexels) ────────────────────────────────────────
-  "FOOTAGE_MATCH_STRICTNESS",  // off | normal (default) | strict — score each Pexels candidate's own description against the scene's queries; skip off-topic ones, fall through query 2/3, then best-available. A scene never fails because of this.
+  // ── Stock footage (multi-source) ──────────────────────────────────
+  "FOOTAGE_SOURCES",           // comma list of libraries to query, in order. Default "pexels,pixabay".
+  "FOOTAGE_AI_PICK",           // on (default) | off — let Gemini pick the most relevant candidate from all sources' results.
+  "FOOTAGE_MATCH_STRICTNESS",  // off | normal (default) | strict — score each candidate's own description against the scene's queries; skip off-topic ones, fall through query 2/3, then best-available. A scene never fails because of this.
   "STOCK_FOOTAGE_ORIENTATION", // landscape | portrait | square
   "STOCK_FOOTAGE_MAX_HEIGHT",  // 720 | 1080 | 2160 — caps file size
   "STOCK_FOOTAGE_MIN_DURATION", // seconds — skip stingers shorter than this
@@ -119,6 +122,7 @@ export const DEFAULTS: Record<SettingKey, string> = {
   // Required API keys — empty by default, user must provide
   GOOGLE_API_KEY: "",
   PEXELS_API_KEY: "",
+  PIXABAY_API_KEY: "",
   AI33PRO_API_KEY: "",
   GROQ_API_KEY: "",
 
@@ -161,6 +165,12 @@ export const DEFAULTS: Record<SettingKey, string> = {
   MAX_PAUSE_SECONDS: "0.6",
 
   // Stock footage (Pexels) — defaults match a typical long-form 16:9 channel.
+  // Query Pexels + Pixabay (both video+photo, no attribution). Add a key for
+  // each you want; a source with no key is silently skipped.
+  FOOTAGE_SOURCES: "pexels,pixabay",
+  // Let Gemini pick the most relevant candidate across all sources' results
+  // (after the local score pre-filters the obvious junk). off = local score only.
+  FOOTAGE_AI_PICK: "on",
   // Reject candidates whose own description shares nothing with our search
   // (the "searched pharmacy basket, got a bathroom basket" fix). Safe default:
   // worst case it falls back to the best available clip, never fails a scene.

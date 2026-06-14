@@ -43,6 +43,12 @@ export const ALL_GROUPS: Group[] = [
         multiline: true,
       },
       {
+        key: "PIXABAY_API_KEY",
+        label: "Pixabay API key (optional — more footage)",
+        desc: "A SECOND free stock library (video + photo, no attribution needed). When set, the app searches Pixabay ALONGSIDE Pexels for every scene and keeps whichever clip matches best. This is the main lever for 'more accurate / less random' footage — one library alone often just doesn't have the exact shot, so a second one dramatically widens coverage. Leave empty to use Pexels only.",
+        examples: "Get it free at https://pixabay.com/api/docs/ (free account → your API key on that page)",
+      },
+      {
         key: "GROQ_API_KEY",
         label: "Groq API key (smooth voice)",
         desc: "Used by the smooth single-shot voiceover mode. The app records the whole narration in one take, then asks Groq to listen back and mark exactly where each scene's words land — so a sentence that spans two scenes is never cut in half. The FREE tier covers normal use (it's only used once per video, on a tiny downsampled copy of the audio). Leave empty only if you switch Voice mode to 'per-scene'.",
@@ -155,6 +161,18 @@ export const ALL_GROUPS: Group[] = [
         examples: "A frugal shopper inside a pharmacy and grocery store; realistic, everyday  ·  Appalachian homestead garden, weathered hands, natural light",
         multiline: true,
         maxLength: 300,
+      },
+      {
+        key: "FOOTAGE_SOURCES",
+        label: "Footage sources",
+        desc: "Which stock libraries to search, comma-separated. The app queries ALL of them for each scene, pools every result together, and picks the best match — so more sources = better odds the exact shot exists. Supported: pexels, pixabay (each needs its API key set in 'Required API Keys'; a source with no key is silently skipped).",
+        examples: "pexels,pixabay (default)  ·  pexels (Pexels only)",
+      },
+      {
+        key: "FOOTAGE_AI_PICK",
+        label: "AI picks the best footage",
+        desc: "When 'on', after gathering candidates from all sources, Gemini reads each candidate's description and picks the one that best matches the scene. The local word-match score pre-filters obvious junk first, so this stays cheap — one short call per scene. 'off' = use the local score only (free, no Gemini calls). Needs the Google key; if Gemini is unavailable it silently falls back to the local score, so a run never fails because of this.",
+        examples: "on (default — best accuracy)  ·  off (local score only, no Gemini cost)",
       },
       {
         key: "FOOTAGE_MATCH_STRICTNESS",

@@ -98,8 +98,8 @@ export async function runPipeline(runId: string, script: string) {
     // with near-identical visual_prompts don't all grab the same clip.
     // Videos and photos have separate id spaces in Pexels, so we track them
     // separately to avoid spurious "duplicate" hits.
-    const videoUsedIds = new Set<number>();
-    const photoUsedIds = new Set<number>();
+    const videoUsedIds = new Set<string>();
+    const photoUsedIds = new Set<string>();
 
     // Collect failure reasons so we can log an aggregated breakdown at the end.
     // On a 691-scene run the per-scene errors scroll out of the visible log
@@ -325,8 +325,8 @@ async function runSingleShot(
   //    dedup id sets so adjacent sub-clips don't all grab the same footage.
   const animConc = Math.max(1, Number(getSetting("ANIMATION_CONCURRENCY") || "5"));
   const limitAnim = pLimit(animConc);
-  const videoUsedIds = new Set<number>();
-  const photoUsedIds = new Set<number>();
+  const videoUsedIds = new Set<string>();
+  const photoUsedIds = new Set<string>();
   const failureReasons: string[] = [];
 
   const settled = await Promise.all(

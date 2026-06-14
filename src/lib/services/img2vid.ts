@@ -25,10 +25,10 @@ export interface AnimateResult {
 }
 
 export interface AnimateOptions {
-  /** Mutable set of Pexels VIDEO ids already used in this run. */
-  videoUsedIds?: Set<number>;
-  /** Mutable set of Pexels PHOTO ids already used in this run. */
-  photoUsedIds?: Set<number>;
+  /** Mutable set of VIDEO asset ids ("source:id") already used in this run. */
+  videoUsedIds?: Set<string>;
+  /** Mutable set of PHOTO asset ids ("source:id") already used in this run. */
+  photoUsedIds?: Set<string>;
   /** Which kind of asset to fetch for this scene. Default "video". */
   mode?: AssetMode;
   /**
@@ -74,7 +74,7 @@ async function pexelsClip(
   runId: string,
   scene: Scene,
   outPath: string,
-  usedIds?: Set<number>
+  usedIds?: Set<string>
 ): Promise<void> {
   const orientation = (getSetting("STOCK_FOOTAGE_ORIENTATION") || "landscape") as Orientation;
   const maxHeight = Math.max(360, Number(getSetting("STOCK_FOOTAGE_MAX_HEIGHT") || "1080"));
@@ -114,7 +114,7 @@ async function pexelsPhoto(
   runId: string,
   scene: Scene,
   outPath: string,
-  usedIds?: Set<number>
+  usedIds?: Set<string>
 ): Promise<void> {
   const orientation = (getSetting("STOCK_FOOTAGE_ORIENTATION") || "landscape") as Orientation;
   const maxHeight = Math.max(360, Number(getSetting("STOCK_FOOTAGE_MAX_HEIGHT") || "1080"));

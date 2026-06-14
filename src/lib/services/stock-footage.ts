@@ -526,21 +526,449 @@ function relevanceThreshold(): number {
   return 0.34; // "normal" — kills shares-nothing / one-word-of-three matches
 }
 
+// ── Multi-source footage (Pexels + Pixabay), unified + AI-picked ─────────────
+//
+// A scene's footage can come from more than one library. We query every
+// configured source for the SAME query, pool all candidates into one normalized
+// shape, score them locally, optionally let Gemini pick the best, then download
+// the winner. Adding sources widens coverage; the relevance gate keeps quality.
+
+const FOOTAGE_UA = "ConveyerGuilherme/1.0 (local video tool)";
+
+/** A normalized candidate from any source, with everything needed to score,
+ *  dedupe, log and download it. `desc` is free text used for relevance. */
+interface FootageHit {
+  source: string;       // "pexels" | "pixabay"
+  dedupeId: string;     // cross-source unique id, e.g. "pexels:123" / "pixabay:45"
+  desc: string;         // slug / alt / tags — scored against the scene's queries
+  author: string | null;
+  sourceUrl: string;
+  meta: string;         // short label for logs, e.g. "1920x1080 12s"
+  download: (outPath: string) => Promise<void>;
+}
+
+/** Which libraries to query, in order. Default Pexels + Pixabay. */
+function configuredFootageSources(): string[] {
+  const raw = getSetting("FOOTAGE_SOURCES") || "pexels,pixabay";
+  const known = new Set(["pexels", "pixabay"]);
+  const list = raw
+    .split(/[\n,;]+/)
+    .map((s) => s.trim().toLowerCase())
+    .filter((s) => known.has(s));
+  return list.length > 0 ? [...new Set(list)] : ["pexels", "pixabay"];
+}
+
+/** Generic stream-download (used by Pixabay + any direct-URL source). */
+async function downloadUrlToFile(url: string, outPath: string): Promise<void> {
+  const resp = await fetch(url, { headers: { "User-Agent": FOOTAGE_UA } });
+  if (!resp.ok) throw new Error(`download HTTP ${resp.status}`);
+  const buf = Buffer.from(await resp.arrayBuffer());
+  if (buf.byteLength === 0) throw new Error("download: empty file");
+  fs.writeFileSync(outPath, buf);
+}
+
+// ── Pexels → FootageHit builders (wrap the existing Pexels primitives) ────────
+
+async function pexelsVideoHits(
+  query: string,
+  opts: { orientation: Orientation; maxHeight: number; minDuration: number; runId: string }
+): Promise<FootageHit[]> {
+  const videos = await searchPexelsVideos(query, {
+    orientation: opts.orientation,
+    minDuration: opts.minDuration,
+    perPage: 30,
+    runId: opts.runId,
+  });
+  const hits: FootageHit[] = [];
+  for (const v of videos) {
+    const file = pickBestVideoFile(v, { maxHeight: opts.maxHeight });
+    if (!file) continue;
+    hits.push({
+      source: "pexels",
+      dedupeId: `pexels:${v.id}`,
+      desc: pexelsSlugTokens(v.url).join(" "),
+      author: v.user?.name ?? null,
+      sourceUrl: v.url,
+      meta: `${file.width}x${file.height} ${v.duration}s`,
+      download: (out) => downloadPexelsVideo(file, out),
+    });
+  }
+  return hits;
+}
+
+async function pexelsPhotoHits(
+  query: string,
+  opts: { orientation: Orientation; maxHeight: number; runId: string }
+): Promise<FootageHit[]> {
+  const photos = await searchPexelsPhotos(query, {
+    orientation: opts.orientation,
+    perPage: 30,
+    runId: opts.runId,
+  });
+  return photos.map((p) => {
+    const url = pickBestPhotoSrc(p, opts.maxHeight);
+    return {
+      source: "pexels",
+      dedupeId: `pexels:${p.id}`,
+      desc: `${p.alt || ""} ${pexelsSlugTokens(p.url).join(" ")}`.trim(),
+      author: p.photographer || null,
+      sourceUrl: p.url,
+      meta: `${p.width}x${p.height}`,
+      download: (out) => downloadPexelsPhoto(url, out),
+    };
+  });
+}
+
+// ── Pixabay → FootageHit builders (video + photo) ─────────────────────────────
+//
+// Pixabay free API: video + photo, no attribution required (Pixabay License).
+// PIXABAY_API_KEY is required; without it these return [] (Pexels-only).
+// Pixabay gives a `tags` keyword list per hit — excellent for relevance scoring.
+
+function pixabayOrientation(o: Orientation): string | null {
+  if (o === "portrait") return "vertical";
+  if (o === "landscape") return "horizontal";
+  return null; // square — Pixabay has no square filter; omit it
+}
+
+function pixabayDesc(tags: string | undefined, pageURL: string | undefined): string {
+  const slug = (() => {
+    try {
+      const segs = new URL(pageURL || "").pathname.split("/").filter(Boolean);
+      return (segs[segs.length - 1] ?? "").replace(/-\d+$/, "").replace(/-/g, " ");
+    } catch {
+      return "";
+    }
+  })();
+  return `${tags || ""} ${slug}`.trim();
+}
+
+async function pixabayVideoHits(
+  query: string,
+  opts: { orientation: Orientation; minDuration: number }
+): Promise<FootageHit[]> {
+  const key = getSetting("PIXABAY_API_KEY").trim();
+  if (!key) return [];
+  const url = new URL("https://pixabay.com/api/videos/");
+  url.searchParams.set("key", key);
+  url.searchParams.set("q", query.slice(0, 100));
+  url.searchParams.set("video_type", "film");
+  url.searchParams.set("safesearch", "true");
+  url.searchParams.set("per_page", "30");
+  const orient = pixabayOrientation(opts.orientation);
+  if (orient) url.searchParams.set("orientation", orient);
+
+  const resp = await fetch(url, { headers: { "User-Agent": FOOTAGE_UA } });
+  if (!resp.ok) throw new Error(`Pixabay videos HTTP ${resp.status}`);
+  const data = (await resp.json()) as {
+    hits?: {
+      id: number;
+      duration?: number;
+      pageURL?: string;
+      user?: string;
+      tags?: string;
+      videos?: Record<string, { url: string; width: number; height: number }>;
+    }[];
+  };
+  const hits: FootageHit[] = [];
+  for (const h of data.hits ?? []) {
+    const v = h.videos?.large?.url ? h.videos.large : h.videos?.medium || h.videos?.small;
+    if (!v?.url) continue;
+    const fileUrl = v.url;
+    hits.push({
+      source: "pixabay",
+      dedupeId: `pixabay:${h.id}`,
+      desc: pixabayDesc(h.tags, h.pageURL),
+      author: h.user ?? null,
+      sourceUrl: h.pageURL ?? "",
+      meta: `${v.width}x${v.height}${h.duration ? ` ${h.duration}s` : ""}`,
+      download: (out) => downloadUrlToFile(fileUrl, out),
+    });
+  }
+  return hits;
+}
+
+async function pixabayPhotoHits(
+  query: string,
+  opts: { orientation: Orientation }
+): Promise<FootageHit[]> {
+  const key = getSetting("PIXABAY_API_KEY").trim();
+  if (!key) return [];
+  const url = new URL("https://pixabay.com/api/");
+  url.searchParams.set("key", key);
+  url.searchParams.set("q", query.slice(0, 100));
+  url.searchParams.set("image_type", "photo");
+  url.searchParams.set("safesearch", "true");
+  url.searchParams.set("per_page", "30");
+  url.searchParams.set("min_width", "1280");
+  const orient = pixabayOrientation(opts.orientation);
+  if (orient) url.searchParams.set("orientation", orient);
+
+  const resp = await fetch(url, { headers: { "User-Agent": FOOTAGE_UA } });
+  if (!resp.ok) throw new Error(`Pixabay images HTTP ${resp.status}`);
+  const data = (await resp.json()) as {
+    hits?: {
+      id: number;
+      pageURL?: string;
+      user?: string;
+      tags?: string;
+      imageWidth?: number;
+      imageHeight?: number;
+      largeImageURL?: string;
+      fullHDURL?: string;
+      webformatURL?: string;
+    }[];
+  };
+  const hits: FootageHit[] = [];
+  for (const h of data.hits ?? []) {
+    const imgUrl = h.fullHDURL || h.largeImageURL || h.webformatURL;
+    if (!imgUrl) continue;
+    hits.push({
+      source: "pixabay",
+      dedupeId: `pixabay:${h.id}`,
+      desc: pixabayDesc(h.tags, h.pageURL),
+      author: h.user ?? null,
+      sourceUrl: h.pageURL ?? "",
+      meta: h.imageWidth && h.imageHeight ? `${h.imageWidth}x${h.imageHeight}` : "photo",
+      download: (out) => downloadUrlToFile(imgUrl, out),
+    });
+  }
+  return hits;
+}
+
+/** Query EVERY configured source for one query, pool the normalized hits.
+ *  A source that errors is logged and skipped (never fails the whole gather). */
+async function gatherHits(
+  kind: "video" | "photo",
+  query: string,
+  opts: { runId: string; orientation: Orientation; maxHeight: number; minDuration: number }
+): Promise<FootageHit[]> {
+  const sources = configuredFootageSources();
+  const tasks = sources.map(async (src): Promise<FootageHit[]> => {
+    try {
+      if (src === "pexels") {
+        return kind === "video"
+          ? await pexelsVideoHits(query, opts)
+          : await pexelsPhotoHits(query, opts);
+      }
+      if (src === "pixabay") {
+        return kind === "video"
+          ? await pixabayVideoHits(query, { orientation: opts.orientation, minDuration: opts.minDuration })
+          : await pixabayPhotoHits(query, { orientation: opts.orientation });
+      }
+      return [];
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      log(opts.runId, "debug", `${src} ${kind} search failed for "${query}": ${msg.slice(0, 120)}`, {
+        stage: "animate",
+      });
+      return [];
+    }
+  });
+  const results = await Promise.all(tasks);
+  // Dedupe across sources (defensive — ids are namespaced so collisions are rare).
+  const seen = new Set<string>();
+  const out: FootageHit[] = [];
+  for (const h of results.flat()) {
+    if (seen.has(h.dedupeId)) continue;
+    seen.add(h.dedupeId);
+    out.push(h);
+  }
+  return out;
+}
+
+interface ScoredHit {
+  hit: FootageHit;
+  score: number;
+  hasDesc: boolean;
+  query: string;
+}
+
+/**
+ * Gemini picks the most relevant candidate. Given the locally-decent pool, it
+ * scores each 0–100 against the scene's visual goal and returns them best-first.
+ * This is the "AI chooses the footage" step. Fail-open: returns null (keep the
+ * local order) when disabled, no Google key, too few candidates, or any error —
+ * a run must NEVER fail because of the picker. Only the top 8 are sent (cheap;
+ * one short call). Disable with FOOTAGE_AI_PICK = off.
+ */
+async function aiReorderHits(runId: string, query: string, pool: ScoredHit[]): Promise<ScoredHit[] | null> {
+  if ((getSetting("FOOTAGE_AI_PICK") || "on").trim().toLowerCase() === "off") return null;
+  const apiKey = getSetting("GOOGLE_API_KEY").trim();
+  if (!apiKey || pool.length <= 1) return null;
+
+  const top = pool.slice(0, 8);
+  const lines = top.map((s, i) => `[${i}] ${(s.hit.desc || s.hit.dedupeId).slice(0, 80)}`).join("\n");
+  const prompt =
+    `Visual goal for a video scene: "${query}"\n\n` +
+    `Stock footage candidates (one per line as "[index] description"):\n${lines}\n\n` +
+    `Score EACH candidate 0-100 for how well it visually matches the goal (100 = exactly this). ` +
+    `Return STRICTLY a JSON array [{"i": <index>, "score": <int>}] for all candidates. No markdown.`;
+  try {
+    const model = getSetting("SCENE_SPLIT_MODEL") || "gemini-flash-latest";
+    const r = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ role: "user", parts: [{ text: prompt }] }],
+          generationConfig: { responseMimeType: "application/json", temperature: 0, maxOutputTokens: 2000, thinkingConfig: { thinkingBudget: 0 } },
+        }),
+      }
+    );
+    if (!r.ok) throw new Error(`Gemini ${r.status}`);
+    const j = (await r.json()) as { candidates?: { content?: { parts?: { text?: string }[] } }[] };
+    const text = j.candidates?.[0]?.content?.parts?.map((p) => p.text ?? "").join("") ?? "";
+    const arr = JSON.parse(text.match(/\[[\s\S]*\]/)?.[0] ?? text) as { i: number; score: number }[];
+    const ai = new Map(arr.map((x) => [Number(x.i), Number(x.score)]));
+    const reordered = top
+      .map((s, i) => ({ s, ai: ai.get(i) ?? -1 }))
+      .sort((a, b) => b.ai - a.ai)
+      .map((x) => x.s);
+    log(runId, "debug", `AI pick for "${query}": top → "${(reordered[0]?.hit.desc || "?").slice(0, 50)}"`, {
+      stage: "animate",
+    });
+    return reordered;
+  } catch {
+    return null; // fail-open — keep local order
+  }
+}
+
+/**
+ * Unified acquire: pull the best matching VIDEO or PHOTO for a scene across all
+ * configured sources. Per query candidate: gather from all sources → score
+ * locally → let Gemini pick the best → download the winner. Below-threshold
+ * hits are held in reserve so a scene NEVER fails for lack of a perfect match
+ * (best-available is used with a warning). Shared `usedIds` (cross-source
+ * "source:id" strings) prevents two scenes grabbing the same asset.
+ */
+async function acquireFootage(
+  kind: "video" | "photo",
+  scene: Scene,
+  outPath: string,
+  options: AcquireOptions
+): Promise<{ author: string | null; sourceUrl: string; source: string }> {
+  const { runId, orientation = "landscape", maxHeight = 1080, minDuration = 4, usedIds } = options;
+  const gatherOpts = { runId, orientation, maxHeight, minDuration };
+
+  const candidates = sceneQueryCandidates(scene);
+  if (candidates.length === 0) {
+    throw new Error(`Scene #${scene.index}: empty query (no visual_queries)`);
+  }
+  const threshold = relevanceThreshold();
+  const queryTokenLists = candidates.map(relevanceTokens);
+  const reserve: ScoredHit[] = [];
+  let lastErr: unknown;
+
+  const tryList = async (list: ScoredHit[]) => {
+    if (list.length === 0) return null;
+    const fresh = usedIds && usedIds.size > 0 ? list.filter((s) => !usedIds.has(s.hit.dedupeId)) : list;
+    const ordered = fresh.length > 0 ? fresh : list;
+    const reusing = fresh.length === 0 && usedIds && usedIds.size > 0;
+    for (const s of ordered) {
+      if (usedIds && usedIds.has(s.hit.dedupeId) && !reusing) continue;
+      if (usedIds && !usedIds.has(s.hit.dedupeId)) usedIds.add(s.hit.dedupeId);
+      try {
+        await s.hit.download(outPath);
+        const reusedTag = reusing ? " (reused — no fresh matches)" : "";
+        log(
+          runId,
+          "info",
+          `${kind} via ${s.hit.source}: ${s.hit.dedupeId} ${s.hit.meta} by ${s.hit.author ?? "?"}${reusedTag} [${s.query} · match ${s.score.toFixed(2)}]`,
+          { stage: "animate", data: { source: s.hit.source, author: s.hit.author, sourceUrl: s.hit.sourceUrl } }
+        );
+        return { author: s.hit.author, sourceUrl: s.hit.sourceUrl, source: s.hit.source };
+      } catch (e) {
+        if (usedIds && !reusing) usedIds.delete(s.hit.dedupeId);
+        lastErr = e;
+        const msg = e instanceof Error ? e.message : String(e);
+        log(runId, "warn", `${s.hit.source} download failed (${s.hit.dedupeId}), trying next: ${msg.slice(0, 150)}`, {
+          stage: "animate",
+        });
+      }
+    }
+    return null;
+  };
+
+  for (let qi = 0; qi < candidates.length; qi++) {
+    const query = candidates[qi];
+    const tag = candidates.length > 1 ? ` (query ${qi + 1}/${candidates.length})` : "";
+    log(runId, "debug", `Footage search [${configuredFootageSources().join("+")}]${tag}: "${query}"`, {
+      stage: "animate",
+    });
+
+    const hits = await gatherHits(kind, query, gatherOpts);
+    if (hits.length === 0) {
+      lastErr = new Error(`no ${kind} results for "${query}"`);
+      if (qi < candidates.length - 1) {
+        log(runId, "debug", `No ${kind} for "${query}" — trying next query`, { stage: "animate" });
+      }
+      continue;
+    }
+
+    const scored: ScoredHit[] = hits.map((h) => {
+      const d = relevanceTokens(h.desc);
+      return { hit: h, score: relevanceScore(d, queryTokenLists), hasDesc: d.length > 0, query };
+    });
+
+    let pool: ScoredHit[];
+    if (threshold > 0 && scored.some((s) => s.hasDesc)) {
+      const ranked = scored.slice().sort((a, b) => b.score - a.score);
+      pool = ranked.filter((s) => s.score >= threshold);
+      reserve.push(...ranked.filter((s) => s.score < threshold));
+      if (pool.length === 0) {
+        const best = ranked[0]?.score ?? 0;
+        log(runId, "debug", `Nothing ≥ ${threshold} for "${query}" (best ${best.toFixed(2)}) — next query`, {
+          stage: "animate",
+        });
+        continue;
+      }
+    } else {
+      pool = scored.slice().sort((a, b) => b.score - a.score);
+    }
+
+    // Gemini picks the single best from the locally-decent pool (his requirement).
+    const reordered = await aiReorderHits(runId, query, pool);
+    const got = await tryList(reordered ?? pool);
+    if (got) return got;
+    // Everything in this query's pool failed to download — try the next query.
+  }
+
+  // Nothing met the bar anywhere — use the best below-threshold candidate.
+  if (reserve.length > 0) {
+    reserve.sort((a, b) => b.score - a.score);
+    log(
+      runId,
+      "warn",
+      `Scene #${scene.index}: no ${kind} met the relevance threshold — using best available (match ${reserve[0].score.toFixed(2)})`,
+      { stage: "animate" }
+    );
+    const got = await tryList(reserve);
+    if (got) return got;
+  }
+
+  const tried = candidates.map((q) => `"${q}"`).join(", ");
+  throw new Error(
+    `No ${kind} found for scene #${scene.index} across [${configuredFootageSources().join("+")}] (tried ${tried})` +
+      (lastErr instanceof Error ? `: ${lastErr.message.slice(0, 150)}` : "")
+  );
+}
+
 export interface AcquireOptions {
   runId: string;
   orientation?: Orientation;
   maxHeight?: number;
   minDuration?: number;
   /**
-   * MUTABLE set of Pexels video ids already claimed/downloaded in this run.
-   * The function reads it to skip duplicates AND adds its own pick into it
-   * atomically before downloading. Atomicity works because JS is single-
-   * threaded — nothing else can interleave between `has()` and `add()`,
-   * so even with 5 parallel scenes no two end up with the same clip.
+   * MUTABLE set of cross-source asset ids ("pexels:123" / "pixabay:45") already
+   * claimed/downloaded in this run. Read to skip duplicates AND added to
+   * atomically before download (JS is single-threaded, so nothing interleaves
+   * between has() and add() — even 5 parallel scenes never grab the same asset).
    *
-   * Pass a fresh `new Set<number>()` per pipeline run.
+   * Pass a fresh `new Set<string>()` per pipeline run.
    */
-  usedIds?: Set<number>;
+  usedIds?: Set<string>;
 }
 
 /**
@@ -559,145 +987,8 @@ export async function acquireStockClipForScene(
   scene: Scene,
   outPath: string,
   options: AcquireOptions
-): Promise<{ pexelsId: number; author: string | null; sourceUrl: string }> {
-  const { runId, orientation = "landscape", maxHeight = 1080, minDuration = 4, usedIds } = options;
-
-  const candidates = sceneQueryCandidates(scene);
-  if (candidates.length === 0) {
-    throw new Error(`Scene #${scene.index}: empty Pexels query (no visual_queries)`);
-  }
-
-  const threshold = relevanceThreshold();
-  const queryTokenLists = candidates.map(relevanceTokens);
-  type ScoredVideo = { video: PexelsVideo; score: number; hasDesc: boolean; query: string };
-  // Below-threshold candidates from every query — the last-resort pool, so a
-  // scene never FAILS because nothing scored well (an off-topic clip beats a hole).
-  const reserve: ScoredVideo[] = [];
-  let lastErr: unknown;
-
-  // Try downloading from a scored list (best first), honouring the shared dedup
-  // set. Returns null when every entry failed to download.
-  const tryList = async (
-    list: ScoredVideo[]
-  ): Promise<{ pexelsId: number; author: string | null; sourceUrl: string } | null> => {
-    if (list.length === 0) return null;
-    // First pass: only un-claimed videos. If all are already used, fall back to
-    // the full list (a reused clip is better than a failed scene).
-    const fresh = usedIds && usedIds.size > 0 ? list.filter((s) => !usedIds.has(s.video.id)) : list;
-    const ordered = fresh.length > 0 ? fresh : list;
-    const reusing = fresh.length === 0 && usedIds && usedIds.size > 0;
-    for (const s of ordered) {
-      // Atomic claim — between has() and add() no other Promise can run.
-      if (usedIds && usedIds.has(s.video.id) && !reusing) continue;
-      const file = pickBestVideoFile(s.video, { maxHeight });
-      if (!file) continue;
-      if (usedIds && !usedIds.has(s.video.id)) usedIds.add(s.video.id);
-
-      try {
-        await downloadPexelsVideo(file, outPath);
-        const author = s.video.user?.name ?? null;
-        const reusedTag = reusing ? " (reused — no fresh matches)" : "";
-        log(
-          runId,
-          "info",
-          `Pexels clip: id=${s.video.id} ${file.width}x${file.height} ${s.video.duration}s by ${author ?? "?"}${reusedTag} [${s.query} · match ${s.score.toFixed(2)}]`,
-          { stage: "animate", data: { pexelsId: s.video.id, author, sourceUrl: s.video.url } }
-        );
-        return { pexelsId: s.video.id, author, sourceUrl: s.video.url };
-      } catch (e) {
-        // Release the claim — this id failed, let another scene try it.
-        if (usedIds && !reusing) usedIds.delete(s.video.id);
-        lastErr = e;
-        const msg = e instanceof Error ? e.message : String(e);
-        log(runId, "warn", `Pexels download failed (${s.video.id}), trying next: ${msg.slice(0, 150)}`, {
-          stage: "animate",
-        });
-      }
-    }
-    return null;
-  };
-
-  // Try each query candidate in order; within a query, prefer the candidates
-  // whose own description actually matches what we searched for.
-  for (let qi = 0; qi < candidates.length; qi++) {
-    const query = candidates[qi];
-    const tag = candidates.length > 1 ? ` (query ${qi + 1}/${candidates.length})` : "";
-    log(runId, "debug", `Pexels search${tag}: "${query}"`, { stage: "animate" });
-
-    let videos: PexelsVideo[];
-    try {
-      // 30 per page (still ONE request) — a wider pool to score for relevance.
-      videos = await searchPexelsVideos(query, { orientation, minDuration, perPage: 30, runId });
-    } catch (e) {
-      lastErr = e;
-      const msg = e instanceof Error ? e.message : String(e);
-      log(runId, "warn", `Pexels search failed for "${query}", trying next: ${msg.slice(0, 150)}`, {
-        stage: "animate",
-      });
-      continue;
-    }
-
-    if (videos.length === 0) {
-      lastErr = new Error(`Pexels returned 0 videos for: "${query}"`);
-      if (qi < candidates.length - 1) {
-        log(runId, "debug", `No videos for "${query}" — trying next query`, { stage: "animate" });
-      }
-      continue;
-    }
-
-    const scored: ScoredVideo[] = videos.map((v) => {
-      const toks = pexelsSlugTokens(v.url);
-      return { video: v, score: relevanceScore(toks, queryTokenLists), hasDesc: toks.length > 0, query };
-    });
-
-    let pool: ScoredVideo[];
-    if (threshold > 0 && scored.some((s) => s.hasDesc)) {
-      // Stable sort: score desc; equal scores keep Pexels' own ranking.
-      const ranked = scored.slice().sort((a, b) => b.score - a.score);
-      pool = ranked.filter((s) => s.score >= threshold);
-      reserve.push(...ranked.filter((s) => s.score < threshold));
-      if (pool.length === 0) {
-        const best = ranked[0]?.score ?? 0;
-        log(
-          runId,
-          "debug",
-          `No clip for "${query}" matches well enough (best ${best.toFixed(2)} < ${threshold}) — trying next query`,
-          { stage: "animate" }
-        );
-        continue;
-      }
-    } else {
-      // Scoring off, or Pexels gave no usable descriptions — keep Pexels' order.
-      pool = scored;
-    }
-
-    const got = await tryList(pool);
-    if (got) return got;
-    // Every pool entry failed to download — fall through to the next query.
-  }
-
-  // Nothing met the threshold for ANY query (or the passing ones all failed to
-  // download) — use the best below-threshold candidate rather than failing.
-  if (reserve.length > 0) {
-    reserve.sort((a, b) => b.score - a.score);
-    log(
-      runId,
-      "warn",
-      `Scene #${scene.index}: no clip met the relevance threshold — using best available (match ${reserve[0].score.toFixed(2)})`,
-      { stage: "animate" }
-    );
-    const got = await tryList(reserve);
-    if (got) return got;
-  }
-
-  const tried = candidates.map((q) => `"${q}"`).join(", ");
-  if (lastErr instanceof Error && /returned 0 videos/.test(lastErr.message)) {
-    throw new Error(`Pexels returned 0 videos for scene #${scene.index} (tried ${tried})`);
-  }
-  throw new Error(
-    `All Pexels candidates failed for scene #${scene.index} (tried ${tried})` +
-      (lastErr instanceof Error ? `: ${lastErr.message.slice(0, 150)}` : "")
-  );
+): Promise<{ author: string | null; sourceUrl: string; source: string }> {
+  return acquireFootage("video", scene, outPath, options);
 }
 
 // ── Photo acquisition (mirror of acquireStockClipForScene) ───────────────────
@@ -706,8 +997,10 @@ export interface AcquirePhotoOptions {
   runId: string;
   orientation?: Orientation;
   maxHeight?: number;
-  /** Mutable set of Pexels PHOTO ids already used in this run (separate from video ids). */
-  usedIds?: Set<number>;
+  /** Mutable set of cross-source PHOTO ids ("pexels:123" / "pixabay:45") used in
+   *  this run. Kept SEPARATE from the video set (a video and a photo can share an
+   *  id within a source, but they're distinct assets). Pass `new Set<string>()`. */
+  usedIds?: Set<string>;
 }
 
 /**
@@ -722,127 +1015,6 @@ export async function acquireStockPhotoForScene(
   scene: Scene,
   outPath: string,
   options: AcquirePhotoOptions
-): Promise<{ pexelsId: number; photographer: string | null; sourceUrl: string }> {
-  const { runId, orientation = "landscape", maxHeight = 1080, usedIds } = options;
-
-  const candidates = sceneQueryCandidates(scene);
-  if (candidates.length === 0) {
-    throw new Error(`Scene #${scene.index}: empty Pexels query (no visual_queries)`);
-  }
-
-  const threshold = relevanceThreshold();
-  const queryTokenLists = candidates.map(relevanceTokens);
-  type ScoredPhoto = { photo: PexelsPhoto; score: number; hasDesc: boolean; query: string };
-  const reserve: ScoredPhoto[] = [];
-  let lastErr: unknown;
-
-  const tryList = async (
-    list: ScoredPhoto[]
-  ): Promise<{ pexelsId: number; photographer: string | null; sourceUrl: string } | null> => {
-    if (list.length === 0) return null;
-    const fresh = usedIds && usedIds.size > 0 ? list.filter((s) => !usedIds.has(s.photo.id)) : list;
-    const ordered = fresh.length > 0 ? fresh : list;
-    const reusing = fresh.length === 0 && usedIds && usedIds.size > 0;
-    for (const s of ordered) {
-      if (usedIds && usedIds.has(s.photo.id) && !reusing) continue;
-      if (usedIds && !usedIds.has(s.photo.id)) usedIds.add(s.photo.id);
-
-      const url = pickBestPhotoSrc(s.photo, maxHeight);
-      try {
-        await downloadPexelsPhoto(url, outPath);
-        const reusedTag = reusing ? " (reused — no fresh matches)" : "";
-        log(
-          runId,
-          "info",
-          `Pexels photo: id=${s.photo.id} ${s.photo.width}x${s.photo.height} by ${s.photo.photographer || "?"}${reusedTag} [${s.query} · match ${s.score.toFixed(2)}]`,
-          { stage: "animate", data: { pexelsId: s.photo.id, photographer: s.photo.photographer, sourceUrl: s.photo.url } }
-        );
-        return { pexelsId: s.photo.id, photographer: s.photo.photographer || null, sourceUrl: s.photo.url };
-      } catch (e) {
-        if (usedIds && !reusing) usedIds.delete(s.photo.id);
-        lastErr = e;
-        const msg = e instanceof Error ? e.message : String(e);
-        log(runId, "warn", `Pexels photo download failed (${s.photo.id}), trying next: ${msg.slice(0, 150)}`, {
-          stage: "animate",
-        });
-      }
-    }
-    return null;
-  };
-
-  for (let qi = 0; qi < candidates.length; qi++) {
-    const query = candidates[qi];
-    const tag = candidates.length > 1 ? ` (query ${qi + 1}/${candidates.length})` : "";
-    log(runId, "debug", `Pexels photo search${tag}: "${query}"`, { stage: "animate" });
-
-    let photos: PexelsPhoto[];
-    try {
-      // 30 per page (still ONE request) — a wider pool to score for relevance.
-      photos = await searchPexelsPhotos(query, { orientation, perPage: 30, runId });
-    } catch (e) {
-      lastErr = e;
-      const msg = e instanceof Error ? e.message : String(e);
-      log(runId, "warn", `Pexels photo search failed for "${query}", trying next: ${msg.slice(0, 150)}`, {
-        stage: "animate",
-      });
-      continue;
-    }
-
-    if (photos.length === 0) {
-      lastErr = new Error(`Pexels returned 0 photos for: "${query}"`);
-      if (qi < candidates.length - 1) {
-        log(runId, "debug", `No photos for "${query}" — trying next query`, { stage: "animate" });
-      }
-      continue;
-    }
-
-    // Photos describe themselves twice: the `alt` sentence AND the URL slug.
-    const scored: ScoredPhoto[] = photos.map((p) => {
-      const toks = [...new Set([...relevanceTokens(p.alt || ""), ...pexelsSlugTokens(p.url)])];
-      return { photo: p, score: relevanceScore(toks, queryTokenLists), hasDesc: toks.length > 0, query };
-    });
-
-    let pool: ScoredPhoto[];
-    if (threshold > 0 && scored.some((s) => s.hasDesc)) {
-      const ranked = scored.slice().sort((a, b) => b.score - a.score);
-      pool = ranked.filter((s) => s.score >= threshold);
-      reserve.push(...ranked.filter((s) => s.score < threshold));
-      if (pool.length === 0) {
-        const best = ranked[0]?.score ?? 0;
-        log(
-          runId,
-          "debug",
-          `No photo for "${query}" matches well enough (best ${best.toFixed(2)} < ${threshold}) — trying next query`,
-          { stage: "animate" }
-        );
-        continue;
-      }
-    } else {
-      pool = scored;
-    }
-
-    const got = await tryList(pool);
-    if (got) return got;
-  }
-
-  if (reserve.length > 0) {
-    reserve.sort((a, b) => b.score - a.score);
-    log(
-      runId,
-      "warn",
-      `Scene #${scene.index}: no photo met the relevance threshold — using best available (match ${reserve[0].score.toFixed(2)})`,
-      { stage: "animate" }
-    );
-    const got = await tryList(reserve);
-    if (got) return got;
-  }
-
-  const tried = candidates.map((q) => `"${q}"`).join(", ");
-  if (lastErr instanceof Error && /returned 0 photos/.test(lastErr.message)) {
-    throw new Error(`Pexels returned 0 photos for scene #${scene.index} (tried ${tried})`);
-  }
-  throw new Error(
-    `All Pexels photo candidates failed for scene #${scene.index} (tried ${tried})` +
-      (lastErr instanceof Error ? `: ${lastErr.message.slice(0, 150)}` : "")
-  );
+): Promise<{ author: string | null; sourceUrl: string; source: string }> {
+  return acquireFootage("photo", scene, outPath, options);
 }
