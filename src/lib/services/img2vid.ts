@@ -38,6 +38,9 @@ export interface AnimateOptions {
    * instead of overwriting `scene_007`.
    */
   fileStem?: string;
+  /** One-line summary of the WHOLE video, passed to the vision relevance scorer
+   *  so footage is judged against the overall context, not just this moment. */
+  videoContext?: string;
 }
 
 export async function animateScene(
@@ -59,9 +62,9 @@ export async function animateScene(
   });
 
   if (mode === "photo") {
-    await pexelsPhoto(runId, scene, filePath, options.photoUsedIds);
+    await pexelsPhoto(runId, scene, filePath, options.photoUsedIds, options.videoContext);
   } else {
-    await pexelsClip(runId, scene, filePath, options.videoUsedIds);
+    await pexelsClip(runId, scene, filePath, options.videoUsedIds, options.videoContext);
   }
 
   log(runId, "success", `Asset ready: ${fileName}`, { stage: "animate" });
@@ -74,7 +77,8 @@ async function pexelsClip(
   runId: string,
   scene: Scene,
   outPath: string,
-  usedIds?: Set<string>
+  usedIds?: Set<string>,
+  videoContext?: string
 ): Promise<void> {
   const orientation = (getSetting("STOCK_FOOTAGE_ORIENTATION") || "landscape") as Orientation;
   const maxHeight = Math.max(360, Number(getSetting("STOCK_FOOTAGE_MAX_HEIGHT") || "1080"));
@@ -90,12 +94,13 @@ async function pexelsClip(
         maxHeight,
         minDuration,
         usedIds,
+        videoContext,
       });
       return;
     } catch (e) {
       lastErr = e;
       const msg = e instanceof Error ? e.message : String(e);
-      if (/returned 0 videos|empty Pexels query/i.test(msg)) throw e;
+      if (/no video found|returned 0 videos|empty query/i.test(msg)) throw e;
       if (attempt < MAX_ATTEMPTS) {
         const delay = 3000 * attempt;
         log(runId, "warn", `Pexels video attempt ${attempt}/${MAX_ATTEMPTS}: ${msg.slice(0, 200)} — retry in ${delay}ms`, {
@@ -114,7 +119,8 @@ async function pexelsPhoto(
   runId: string,
   scene: Scene,
   outPath: string,
-  usedIds?: Set<string>
+  usedIds?: Set<string>,
+  videoContext?: string
 ): Promise<void> {
   const orientation = (getSetting("STOCK_FOOTAGE_ORIENTATION") || "landscape") as Orientation;
   const maxHeight = Math.max(360, Number(getSetting("STOCK_FOOTAGE_MAX_HEIGHT") || "1080"));
@@ -128,12 +134,13 @@ async function pexelsPhoto(
         orientation,
         maxHeight,
         usedIds,
+        videoContext,
       });
       return;
     } catch (e) {
       lastErr = e;
       const msg = e instanceof Error ? e.message : String(e);
-      if (/returned 0 photos|empty Pexels query/i.test(msg)) throw e;
+      if (/no photo found|returned 0 photos|empty query/i.test(msg)) throw e;
       if (attempt < MAX_ATTEMPTS) {
         const delay = 3000 * attempt;
         log(runId, "warn", `Pexels photo attempt ${attempt}/${MAX_ATTEMPTS}: ${msg.slice(0, 200)} — retry in ${delay}ms`, {

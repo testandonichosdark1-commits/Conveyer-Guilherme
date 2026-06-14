@@ -127,13 +127,15 @@ export async function runPipeline(runId: string, script: string) {
       }
     }
 
+    const videoContext = buildVideoContext(scenes);
+
     const processScene = async (scene: Scene): Promise<SceneResult> => {
       try {
         checkCancelled(runId);
         const mode = photoScenes.has(scene.index) ? "photo" : "video";
         const [audio, asset] = await Promise.all([
           limitTts(() => synthesizeScene(runId, scene, audioDir)),
-          limitAnim(() => animateScene(runId, scene, animDir, { mode, videoUsedIds, photoUsedIds })),
+          limitAnim(() => animateScene(runId, scene, animDir, { mode, videoUsedIds, photoUsedIds, videoContext })),
         ]);
         if (!asset) throw new Error(`Scene #${scene.index} produced no visual asset`);
         // Photo scenes use imagePath only (ken-burns). Video scenes set both
@@ -321,6 +323,8 @@ async function runSingleShot(
   //     the first N seconds by default ("hook") — captions everywhere gets noisy.
   assignTextOverlays(runId, scenes, plans, rangeByScene);
 
+  const videoContext = buildVideoContext(scenes);
+
   // 5. Fetch every sub-clip's Pexels asset, concurrency-limited, sharing the
   //    dedup id sets so adjacent sub-clips don't all grab the same footage.
   const animConc = Math.max(1, Number(getSetting("ANIMATION_CONCURRENCY") || "5"));
@@ -339,6 +343,7 @@ async function runSingleShot(
             videoUsedIds,
             photoUsedIds,
             fileStem: plan.fileStem,
+            videoContext,
           });
           if (!asset) throw new Error(`Scene #${plan.scene.index} produced no visual asset`);
           return {
@@ -449,6 +454,19 @@ function assignTextOverlays(
       { stage: "assemble" }
     );
   }
+}
+
+/**
+ * A one-line summary of the WHOLE video, passed to the vision relevance scorer
+ * so footage is judged against the overall context (not just the single moment).
+ * Uses the manual VIDEO_CONTEXT hint if set, else the script's opening words
+ * (intros reliably establish the topic/setting).
+ */
+function buildVideoContext(scenes: Scene[]): string {
+  const manual = (getSetting("VIDEO_CONTEXT") || "").trim();
+  if (manual) return manual.slice(0, 300);
+  const full = scenes.map((s) => s.text).join(" ").replace(/\s+/g, " ").trim();
+  return full.split(/\s+/).slice(0, 60).join(" ");
 }
 
 /**

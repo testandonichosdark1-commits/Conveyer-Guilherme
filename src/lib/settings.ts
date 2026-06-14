@@ -35,8 +35,7 @@ export const SETTING_KEYS = [
 
   // ── Stock footage (multi-source) ──────────────────────────────────
   "FOOTAGE_SOURCES",           // comma list of libraries to query, in order. Default "pexels,pixabay".
-  "FOOTAGE_AI_PICK",           // on (default) | off — let Gemini pick the most relevant candidate from all sources' results.
-  "FOOTAGE_MATCH_STRICTNESS",  // off | normal (default) | strict — score each candidate's own description against the scene's queries; skip off-topic ones, fall through query 2/3, then best-available. A scene never fails because of this.
+  "FOOTAGE_AI_PICK",           // on (default) | off — let Gemini LOOK AT each candidate thumbnail and pick the best match. Relevance bar is hardcoded (80% → cascades to 70/60/50, then best-available). off = local text-match score only.
   "STOCK_FOOTAGE_ORIENTATION", // landscape | portrait | square
   "STOCK_FOOTAGE_MAX_HEIGHT",  // 720 | 1080 | 2160 — caps file size
   "STOCK_FOOTAGE_MIN_DURATION", // seconds — skip stingers shorter than this
@@ -168,13 +167,10 @@ export const DEFAULTS: Record<SettingKey, string> = {
   // Query Pexels + Pixabay (both video+photo, no attribution). Add a key for
   // each you want; a source with no key is silently skipped.
   FOOTAGE_SOURCES: "pexels,pixabay",
-  // Let Gemini pick the most relevant candidate across all sources' results
-  // (after the local score pre-filters the obvious junk). off = local score only.
+  // Gemini LOOKS AT each candidate's thumbnail and scores how well it fits the
+  // scene + whole-video context; the best ≥80% wins (cascades 80→70→60→50, then
+  // best-available — a scene never fails). off = local text-match score only.
   FOOTAGE_AI_PICK: "on",
-  // Reject candidates whose own description shares nothing with our search
-  // (the "searched pharmacy basket, got a bathroom basket" fix). Safe default:
-  // worst case it falls back to the best available clip, never fails a scene.
-  FOOTAGE_MATCH_STRICTNESS: "normal",
   STOCK_FOOTAGE_ORIENTATION: "landscape",
   STOCK_FOOTAGE_MAX_HEIGHT: "1080",
   STOCK_FOOTAGE_MIN_DURATION: "4",

@@ -171,14 +171,8 @@ export const ALL_GROUPS: Group[] = [
       {
         key: "FOOTAGE_AI_PICK",
         label: "AI picks the best footage",
-        desc: "When 'on', after gathering candidates from all sources, Gemini reads each candidate's description and picks the one that best matches the scene. The local word-match score pre-filters obvious junk first, so this stays cheap — one short call per scene. 'off' = use the local score only (free, no Gemini calls). Needs the Google key; if Gemini is unavailable it silently falls back to the local score, so a run never fails because of this.",
-        examples: "on (default — best accuracy)  ·  off (local score only, no Gemini cost)",
-      },
-      {
-        key: "FOOTAGE_MATCH_STRICTNESS",
-        label: "Footage match strictness",
-        desc: "How picky the app is about whether a found clip ACTUALLY matches the scene. Pexels describes every clip (e.g. 'woman shopping in a pharmacy') — the app reads that description and scores it against the scene's search queries. Clips that share nothing with what we asked for are SKIPPED and the scene's other queries are tried instead.\n\n• 'normal' (default) — rejects clearly off-topic clips (the 'searched pharmacy basket, got a bathroom basket' case).\n• 'strict' — demands a stronger match. Better aim, but on rare topics it falls back to 'best available' more often.\n• 'off' — old behavior: always trust Pexels' first result.\n\nA scene NEVER fails because of this: if nothing matches well anywhere, the app logs a warning and uses the best clip it found. The run log shows the score of every chosen clip (e.g. 'match 0.67').",
-        examples: "normal (default)  ·  strict = better aim, more fallbacks  ·  off = trust Pexels' #1",
+        desc: "When 'on', the app gathers candidate clips from all sources, then Gemini LOOKS AT each candidate's preview image and scores how well it fits this scene AND the whole video — and keeps the best match (it aims for a strong match, widening the search a few times, and only settles for a looser one if nothing better exists; a scene never ends up empty). The run log shows the chosen clip's match %.\n\n'off' = skip the AI look and use a simpler text keyword match instead (no Gemini calls). Needs the Google key; if Gemini is briefly unavailable it falls back to the text match automatically, so a run never fails.",
+        examples: "on (default — looks at the actual footage)  ·  off (keyword match only)",
       },
       {
         key: "STOCK_FOOTAGE_ORIENTATION",

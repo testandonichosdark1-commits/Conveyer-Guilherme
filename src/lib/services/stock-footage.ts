@@ -518,14 +518,6 @@ function relevanceScore(candTokens: string[], queryTokenLists: string[][]): numb
   return best;
 }
 
-/** FOOTAGE_MATCH_STRICTNESS → minimum relevance score. 0 = scoring off. */
-function relevanceThreshold(): number {
-  const v = (getSetting("FOOTAGE_MATCH_STRICTNESS") || "normal").trim().toLowerCase();
-  if (v === "off") return 0;
-  if (v === "strict") return 0.6;
-  return 0.34; // "normal" — kills shares-nothing / one-word-of-three matches
-}
-
 // ── Multi-source footage (Pexels + Pixabay), unified + AI-picked ─────────────
 //
 // A scene's footage can come from more than one library. We query every
@@ -540,7 +532,8 @@ const FOOTAGE_UA = "ConveyerGuilherme/1.0 (local video tool)";
 interface FootageHit {
   source: string;       // "pexels" | "pixabay"
   dedupeId: string;     // cross-source unique id, e.g. "pexels:123" / "pixabay:45"
-  desc: string;         // slug / alt / tags — scored against the scene's queries
+  desc: string;         // slug / alt / tags — used by the text fallback scorer
+  thumbUrl: string;     // small preview image — what the VISION scorer actually looks at ("" if none)
   author: string | null;
   sourceUrl: string;
   meta: string;         // short label for logs, e.g. "1920x1080 12s"
@@ -587,6 +580,7 @@ async function pexelsVideoHits(
       source: "pexels",
       dedupeId: `pexels:${v.id}`,
       desc: pexelsSlugTokens(v.url).join(" "),
+      thumbUrl: v.image || "",
       author: v.user?.name ?? null,
       sourceUrl: v.url,
       meta: `${file.width}x${file.height} ${v.duration}s`,
@@ -611,6 +605,7 @@ async function pexelsPhotoHits(
       source: "pexels",
       dedupeId: `pexels:${p.id}`,
       desc: `${p.alt || ""} ${pexelsSlugTokens(p.url).join(" ")}`.trim(),
+      thumbUrl: p.src?.medium || p.src?.small || "",
       author: p.photographer || null,
       sourceUrl: p.url,
       meta: `${p.width}x${p.height}`,
@@ -667,7 +662,7 @@ async function pixabayVideoHits(
       pageURL?: string;
       user?: string;
       tags?: string;
-      videos?: Record<string, { url: string; width: number; height: number }>;
+      videos?: Record<string, { url: string; width: number; height: number; thumbnail?: string }>;
     }[];
   };
   const hits: FootageHit[] = [];
@@ -679,6 +674,7 @@ async function pixabayVideoHits(
       source: "pixabay",
       dedupeId: `pixabay:${h.id}`,
       desc: pixabayDesc(h.tags, h.pageURL),
+      thumbUrl: v.thumbnail || h.videos?.small?.thumbnail || "",
       author: h.user ?? null,
       sourceUrl: h.pageURL ?? "",
       meta: `${v.width}x${v.height}${h.duration ? ` ${h.duration}s` : ""}`,
@@ -717,6 +713,7 @@ async function pixabayPhotoHits(
       largeImageURL?: string;
       fullHDURL?: string;
       webformatURL?: string;
+      previewURL?: string;
     }[];
   };
   const hits: FootageHit[] = [];
@@ -727,6 +724,7 @@ async function pixabayPhotoHits(
       source: "pixabay",
       dedupeId: `pixabay:${h.id}`,
       desc: pixabayDesc(h.tags, h.pageURL),
+      thumbUrl: h.webformatURL || h.previewURL || "",
       author: h.user ?? null,
       sourceUrl: h.pageURL ?? "",
       meta: h.imageWidth && h.imageHeight ? `${h.imageWidth}x${h.imageHeight}` : "photo",
@@ -777,33 +775,73 @@ async function gatherHits(
   return out;
 }
 
-interface ScoredHit {
-  hit: FootageHit;
-  score: number;
-  hasDesc: boolean;
-  query: string;
+/** Downloads a thumbnail → base64 for an inline Gemini Vision image part.
+ *  Returns null on any problem (non-image, too big, error) so the caller skips it. */
+async function fetchThumbInline(url: string): Promise<{ data: string; mime: string } | null> {
+  try {
+    const r = await fetch(url, { headers: { "User-Agent": FOOTAGE_UA } });
+    if (!r.ok) return null;
+    const mime = (r.headers.get("content-type") || "image/jpeg").split(";")[0].trim();
+    if (!/^image\//.test(mime)) return null;
+    const buf = Buffer.from(await r.arrayBuffer());
+    if (buf.byteLength === 0 || buf.byteLength > 4_000_000) return null;
+    return { data: buf.toString("base64"), mime };
+  } catch {
+    return null;
+  }
+}
+
+/** Progressively broaden a query to widen the candidate net on later attempts. */
+function broadenQuery(query: string, level: number): string {
+  if (level <= 0) return query;
+  const words = relevanceTokens(query);
+  const keep = level === 1 ? 4 : 2; // attempt 2 → top 4 words, attempt 3 → top 2
+  return (words.length ? words : query.split(/\s+/)).slice(0, keep).join(" ") || query;
 }
 
 /**
- * Gemini picks the most relevant candidate. Given the locally-decent pool, it
- * scores each 0–100 against the scene's visual goal and returns them best-first.
- * This is the "AI chooses the footage" step. Fail-open: returns null (keep the
- * local order) when disabled, no Google key, too few candidates, or any error —
- * a run must NEVER fail because of the picker. Only the top 8 are sent (cheap;
- * one short call). Disable with FOOTAGE_AI_PICK = off.
+ * VISION relevance — Gemini LOOKS AT each candidate's thumbnail (not its text)
+ * and scores 0..1 how well the IMAGE fits (a) this scene's narration moment and
+ * (b) the whole video's context. One call, up to `MAX` thumbnails attached.
+ * Returns scores per hit, or null when disabled / no key / no usable thumbnails
+ * / any error — the caller then falls back to the local text score, so a run is
+ * NEVER blocked by the vision step.
  */
-async function aiReorderHits(runId: string, query: string, pool: ScoredHit[]): Promise<ScoredHit[] | null> {
+async function aiScoreHitsByVision(
+  runId: string,
+  sceneText: string,
+  videoContext: string,
+  hits: FootageHit[]
+): Promise<Map<string, number> | null> {
   if ((getSetting("FOOTAGE_AI_PICK") || "on").trim().toLowerCase() === "off") return null;
   const apiKey = getSetting("GOOGLE_API_KEY").trim();
-  if (!apiKey || pool.length <= 1) return null;
+  if (!apiKey) return null;
 
-  const top = pool.slice(0, 8);
-  const lines = top.map((s, i) => `[${i}] ${(s.hit.desc || s.hit.dedupeId).slice(0, 80)}`).join("\n");
-  const prompt =
-    `Visual goal for a video scene: "${query}"\n\n` +
-    `Stock footage candidates (one per line as "[index] description"):\n${lines}\n\n` +
-    `Score EACH candidate 0-100 for how well it visually matches the goal (100 = exactly this). ` +
-    `Return STRICTLY a JSON array [{"i": <index>, "score": <int>}] for all candidates. No markdown.`;
+  const MAX = 10;
+  const subset = hits.filter((h) => h.thumbUrl).slice(0, MAX);
+  if (subset.length === 0) return null;
+
+  const thumbs = await Promise.all(subset.map((h) => fetchThumbInline(h.thumbUrl)));
+  const usable = subset
+    .map((h, i) => ({ h, t: thumbs[i] }))
+    .filter((x): x is { h: FootageHit; t: { data: string; mime: string } } => x.t !== null);
+  if (usable.length === 0) return null;
+
+  const parts: unknown[] = [
+    {
+      text:
+        `You are choosing B-roll footage for ONE moment of a video.\n` +
+        (videoContext ? `The whole video is about: "${videoContext.slice(0, 300)}".\n` : "") +
+        `This moment's narration: "${sceneText.slice(0, 300)}".\n\n` +
+        `${usable.length} candidate images follow, each labelled "index N". LOOK AT EACH IMAGE and score 0-100 how well what is ACTUALLY SHOWN fits this moment AND the video's overall context (100 = perfect on-screen match). Judge only by the visible content, not by any text.\n` +
+        `Return STRICTLY a JSON array [{"i":<N>,"score":<int>}] covering all ${usable.length}. No markdown.`,
+    },
+  ];
+  usable.forEach((x, i) => {
+    parts.push({ text: `index ${i}` });
+    parts.push({ inlineData: { mimeType: x.t.mime, data: x.t.data } });
+  });
+
   try {
     const model = getSetting("SCENE_SPLIT_MODEL") || "gemini-flash-latest";
     const r = await fetch(
@@ -812,56 +850,72 @@ async function aiReorderHits(runId: string, query: string, pool: ScoredHit[]): P
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          contents: [{ role: "user", parts: [{ text: prompt }] }],
+          contents: [{ role: "user", parts }],
           generationConfig: { responseMimeType: "application/json", temperature: 0, maxOutputTokens: 2000, thinkingConfig: { thinkingBudget: 0 } },
         }),
       }
     );
-    if (!r.ok) throw new Error(`Gemini ${r.status}`);
+    if (!r.ok) throw new Error(`Gemini vision ${r.status}`);
     const j = (await r.json()) as { candidates?: { content?: { parts?: { text?: string }[] } }[] };
     const text = j.candidates?.[0]?.content?.parts?.map((p) => p.text ?? "").join("") ?? "";
     const arr = JSON.parse(text.match(/\[[\s\S]*\]/)?.[0] ?? text) as { i: number; score: number }[];
-    const ai = new Map(arr.map((x) => [Number(x.i), Number(x.score)]));
-    const reordered = top
-      .map((s, i) => ({ s, ai: ai.get(i) ?? -1 }))
-      .sort((a, b) => b.ai - a.ai)
-      .map((x) => x.s);
-    log(runId, "debug", `AI pick for "${query}": top → "${(reordered[0]?.hit.desc || "?").slice(0, 50)}"`, {
+    const byDedupe = new Map<string, number>();
+    for (const x of arr) {
+      const u = usable[Number(x.i)];
+      if (u) byDedupe.set(u.h.dedupeId, Math.max(0, Math.min(100, Number(x.score))) / 100);
+    }
+    return byDedupe.size > 0 ? byDedupe : null;
+  } catch (e) {
+    log(runId, "debug", `Vision scoring unavailable (fallback to text score): ${(e as Error).message.slice(0, 100)}`, {
       stage: "animate",
     });
-    return reordered;
-  } catch {
-    return null; // fail-open — keep local order
+    return null;
   }
 }
 
+interface PoolHit {
+  hit: FootageHit;
+  score: number;        // 0..1 — vision score if available, else local text score
+  via: "vision" | "text";
+  query: string;
+}
+
 /**
- * Unified acquire: pull the best matching VIDEO or PHOTO for a scene across all
- * configured sources. Per query candidate: gather from all sources → score
- * locally → let Gemini pick the best → download the winner. Below-threshold
- * hits are held in reserve so a scene NEVER fails for lack of a perfect match
- * (best-available is used with a warning). Shared `usedIds` (cross-source
- * "source:id" strings) prevents two scenes grabbing the same asset.
+ * Unified acquire: best matching VIDEO or PHOTO for a scene across all sources.
+ *
+ * Per Vlad's spec:
+ *   1. Search Pexels + Pixabay for the scene's query; pool the candidates.
+ *   2. Gemini LOOKS AT each candidate's thumbnail and scores it 0–100 vs this
+ *      moment + the whole-video context (falls back to a local text score if
+ *      vision is unavailable).
+ *   3. If any candidate scores ≥ 80%, take the HIGHEST and stop. Otherwise
+ *      broaden the search and try again, up to 3 attempts total.
+ *   4. After 3 attempts with nothing ≥ 80%, descend the bar (70% → 60% → 50%)
+ *      over everything found so far and take the highest that clears it.
+ *   5. If still nothing, take the single best candidate — a scene NEVER fails.
+ *
+ * Thresholds are hardcoded (not user-facing). Shared cross-source `usedIds`
+ * ("source:id") stop two scenes grabbing the same asset.
  */
+const VISION_TIERS = [0.8, 0.7, 0.6, 0.5];
+
 async function acquireFootage(
   kind: "video" | "photo",
   scene: Scene,
   outPath: string,
   options: AcquireOptions
 ): Promise<{ author: string | null; sourceUrl: string; source: string }> {
-  const { runId, orientation = "landscape", maxHeight = 1080, minDuration = 4, usedIds } = options;
+  const { runId, orientation = "landscape", maxHeight = 1080, minDuration = 4, usedIds, videoContext = "" } = options;
   const gatherOpts = { runId, orientation, maxHeight, minDuration };
 
-  const candidates = sceneQueryCandidates(scene);
-  if (candidates.length === 0) {
+  const baseQueries = sceneQueryCandidates(scene);
+  if (baseQueries.length === 0) {
     throw new Error(`Scene #${scene.index}: empty query (no visual_queries)`);
   }
-  const threshold = relevanceThreshold();
-  const queryTokenLists = candidates.map(relevanceTokens);
-  const reserve: ScoredHit[] = [];
+  const queryTokenLists = baseQueries.map(relevanceTokens);
   let lastErr: unknown;
 
-  const tryList = async (list: ScoredHit[]) => {
+  const tryList = async (list: PoolHit[]) => {
     if (list.length === 0) return null;
     const fresh = usedIds && usedIds.size > 0 ? list.filter((s) => !usedIds.has(s.hit.dedupeId)) : list;
     const ordered = fresh.length > 0 ? fresh : list;
@@ -875,7 +929,7 @@ async function acquireFootage(
         log(
           runId,
           "info",
-          `${kind} via ${s.hit.source}: ${s.hit.dedupeId} ${s.hit.meta} by ${s.hit.author ?? "?"}${reusedTag} [${s.query} · match ${s.score.toFixed(2)}]`,
+          `${kind} via ${s.hit.source}: ${s.hit.dedupeId} ${s.hit.meta} by ${s.hit.author ?? "?"}${reusedTag} [${s.via} match ${(s.score * 100).toFixed(0)}% · "${s.query}"]`,
           { stage: "animate", data: { source: s.hit.source, author: s.hit.author, sourceUrl: s.hit.sourceUrl } }
         );
         return { author: s.hit.author, sourceUrl: s.hit.sourceUrl, source: s.hit.source };
@@ -891,64 +945,78 @@ async function acquireFootage(
     return null;
   };
 
-  for (let qi = 0; qi < candidates.length; qi++) {
-    const query = candidates[qi];
-    const tag = candidates.length > 1 ? ` (query ${qi + 1}/${candidates.length})` : "";
-    log(runId, "debug", `Footage search [${configuredFootageSources().join("+")}]${tag}: "${query}"`, {
+  // Accumulate scored candidates across attempts (deduped by asset id).
+  const pool: PoolHit[] = [];
+  const seen = new Set<string>();
+
+  // Up to 3 search attempts; broaden the query each round to widen the net.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const baseQuery = baseQueries[Math.min(attempt, baseQueries.length - 1)];
+    const query = attempt < baseQueries.length ? baseQuery : broadenQuery(baseQueries[0], attempt);
+    log(runId, "debug", `Footage search [${configuredFootageSources().join("+")}] attempt ${attempt + 1}/3: "${query}"`, {
       stage: "animate",
     });
 
-    const hits = await gatherHits(kind, query, gatherOpts);
+    const hits = (await gatherHits(kind, query, gatherOpts)).filter((h) => !seen.has(h.dedupeId));
     if (hits.length === 0) {
-      lastErr = new Error(`no ${kind} results for "${query}"`);
-      if (qi < candidates.length - 1) {
-        log(runId, "debug", `No ${kind} for "${query}" — trying next query`, { stage: "animate" });
-      }
+      lastErr = lastErr ?? new Error(`no ${kind} results for "${query}"`);
       continue;
     }
+    hits.forEach((h) => seen.add(h.dedupeId));
 
-    const scored: ScoredHit[] = hits.map((h) => {
-      const d = relevanceTokens(h.desc);
-      return { hit: h, score: relevanceScore(d, queryTokenLists), hasDesc: d.length > 0, query };
-    });
+    // Local text score — used to pre-pick which thumbnails to send to vision,
+    // and as the fallback score when vision is unavailable.
+    const localScored = hits
+      .map((h) => ({ hit: h, local: relevanceScore(relevanceTokens(h.desc), queryTokenLists) }))
+      .sort((a, b) => b.local - a.local);
+    const toScore = localScored.slice(0, 10).map((x) => x.hit);
 
-    let pool: ScoredHit[];
-    if (threshold > 0 && scored.some((s) => s.hasDesc)) {
-      const ranked = scored.slice().sort((a, b) => b.score - a.score);
-      pool = ranked.filter((s) => s.score >= threshold);
-      reserve.push(...ranked.filter((s) => s.score < threshold));
-      if (pool.length === 0) {
-        const best = ranked[0]?.score ?? 0;
-        log(runId, "debug", `Nothing ≥ ${threshold} for "${query}" (best ${best.toFixed(2)}) — next query`, {
+    const vision = await aiScoreHitsByVision(runId, scene.text, videoContext, toScore);
+    for (const x of localScored) {
+      const v = vision?.get(x.hit.dedupeId);
+      pool.push({
+        hit: x.hit,
+        score: v !== undefined ? v : x.local,
+        via: v !== undefined ? "vision" : "text",
+        query,
+      });
+    }
+    pool.sort((a, b) => b.score - a.score);
+
+    // Found a strong (≥80%) match → take the best and stop searching.
+    if (pool[0] && pool[0].score >= VISION_TIERS[0]) {
+      const got = await tryList(pool.filter((p) => p.score >= VISION_TIERS[0]));
+      if (got) return got;
+    } else if (attempt < 2) {
+      log(runId, "debug", `Best so far ${((pool[0]?.score ?? 0) * 100).toFixed(0)}% < 80% — broadening`, {
+        stage: "animate",
+      });
+    }
+  }
+
+  // No ≥80% match after 3 attempts — descend the bar over everything found.
+  if (pool.length > 0) {
+    pool.sort((a, b) => b.score - a.score);
+    for (const tier of VISION_TIERS) {
+      const atTier = pool.filter((p) => p.score >= tier);
+      if (atTier.length === 0) continue;
+      if (tier < VISION_TIERS[0]) {
+        log(runId, "info", `Scene #${scene.index}: no ≥80% match — taking best ≥${(tier * 100).toFixed(0)}% (${(atTier[0].score * 100).toFixed(0)}%)`, {
           stage: "animate",
         });
-        continue;
       }
-    } else {
-      pool = scored.slice().sort((a, b) => b.score - a.score);
+      const got = await tryList(atTier);
+      if (got) return got;
     }
-
-    // Gemini picks the single best from the locally-decent pool (his requirement).
-    const reordered = await aiReorderHits(runId, query, pool);
-    const got = await tryList(reordered ?? pool);
-    if (got) return got;
-    // Everything in this query's pool failed to download — try the next query.
-  }
-
-  // Nothing met the bar anywhere — use the best below-threshold candidate.
-  if (reserve.length > 0) {
-    reserve.sort((a, b) => b.score - a.score);
-    log(
-      runId,
-      "warn",
-      `Scene #${scene.index}: no ${kind} met the relevance threshold — using best available (match ${reserve[0].score.toFixed(2)})`,
-      { stage: "animate" }
-    );
-    const got = await tryList(reserve);
+    // Below every tier — take the single best rather than fail the scene.
+    log(runId, "warn", `Scene #${scene.index}: weak match only — using best available (${((pool[0]?.score ?? 0) * 100).toFixed(0)}%)`, {
+      stage: "animate",
+    });
+    const got = await tryList(pool);
     if (got) return got;
   }
 
-  const tried = candidates.map((q) => `"${q}"`).join(", ");
+  const tried = baseQueries.map((q) => `"${q}"`).join(", ");
   throw new Error(
     `No ${kind} found for scene #${scene.index} across [${configuredFootageSources().join("+")}] (tried ${tried})` +
       (lastErr instanceof Error ? `: ${lastErr.message.slice(0, 150)}` : "")
@@ -969,6 +1037,8 @@ export interface AcquireOptions {
    * Pass a fresh `new Set<string>()` per pipeline run.
    */
   usedIds?: Set<string>;
+  /** One-line summary of the whole video, for the vision relevance scorer. */
+  videoContext?: string;
 }
 
 /**
@@ -1001,6 +1071,8 @@ export interface AcquirePhotoOptions {
    *  this run. Kept SEPARATE from the video set (a video and a photo can share an
    *  id within a source, but they're distinct assets). Pass `new Set<string>()`. */
   usedIds?: Set<string>;
+  /** One-line summary of the whole video, for the vision relevance scorer. */
+  videoContext?: string;
 }
 
 /**
