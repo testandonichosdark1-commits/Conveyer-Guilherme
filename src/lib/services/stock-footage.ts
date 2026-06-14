@@ -540,15 +540,17 @@ interface FootageHit {
   download: (outPath: string) => Promise<void>;
 }
 
-/** Which libraries to query, in order. Default Pexels + Pixabay. */
+/** Which libraries to query. pexels/pixabay/archive give VIDEO (+ photos for the
+ *  first two); openverse/wikimedia give CC images. Default = the four free,
+ *  no-/light-attribution libraries; "archive" is opt-in. */
 function configuredFootageSources(): string[] {
-  const raw = getSetting("FOOTAGE_SOURCES") || "pexels,pixabay";
-  const known = new Set(["pexels", "pixabay"]);
+  const raw = getSetting("FOOTAGE_SOURCES") || "pexels,pixabay,openverse,wikimedia";
+  const known = new Set(["pexels", "pixabay", "openverse", "wikimedia", "archive"]);
   const list = raw
     .split(/[\n,;]+/)
     .map((s) => s.trim().toLowerCase())
     .filter((s) => known.has(s));
-  return list.length > 0 ? [...new Set(list)] : ["pexels", "pixabay"];
+  return list.length > 0 ? [...new Set(list)] : ["pexels", "pixabay", "openverse", "wikimedia"];
 }
 
 /** Generic stream-download (used by Pixabay + any direct-URL source). */
@@ -734,8 +736,147 @@ async function pixabayPhotoHits(
   return hits;
 }
 
+// ── CC / public-domain sources: Openverse + Wikimedia (images), Archive (video)
+//
+// Ported from Conveyer Patrice. These WIDEN coverage for niche scenes Pexels/
+// Pixabay lack. IMPORTANT: unlike Pexels/Pixabay, most of these are CC-licensed
+// and REQUIRE attribution (author + source) in the video description — the run
+// log prints author/source/license for every chosen clip so it can be credited.
+
+/** Cleans a title-ish string into scoreable words ("File:Old pharmacy 1920.jpg"
+ *  → "Old pharmacy"). */
+function titleWords(s: string): string {
+  return s
+    .replace(/^File:/i, "")
+    .replace(/\.[a-z0-9]{2,4}$/i, "")
+    .replace(/[_-]+/g, " ")
+    .replace(/<[^>]+>/g, "")
+    .trim();
+}
+
+/** Openverse — huge CC image pool. Optional OPENVERSE_TOKEN raises rate limits. */
+async function openverseHits(query: string): Promise<FootageHit[]> {
+  const url = new URL("https://api.openverse.org/v1/images/");
+  url.searchParams.set("q", query);
+  url.searchParams.set("license", "pdm,cc0,by,by-sa");
+  url.searchParams.set("license_type", "commercial,modification");
+  url.searchParams.set("page_size", "20");
+  const headers: Record<string, string> = { "User-Agent": FOOTAGE_UA };
+  const token = getSetting("OPENVERSE_TOKEN").trim();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const resp = await fetch(url, { headers });
+  if (!resp.ok) throw new Error(`Openverse ${resp.status}`);
+  const data = (await resp.json()) as {
+    results?: { id: string; url?: string; thumbnail?: string; title?: string; creator?: string; foreign_landing_url?: string; license?: string; tags?: { name?: string }[] }[];
+  };
+  const hits: FootageHit[] = [];
+  for (const r of data.results ?? []) {
+    if (!r.url) continue;
+    const tags = (r.tags ?? []).map((t) => t.name).filter(Boolean).join(" ");
+    const imgUrl = r.url;
+    hits.push({
+      source: "openverse",
+      dedupeId: `openverse:${r.id}`,
+      desc: `${titleWords(r.title || "")} ${tags}`.trim(),
+      thumbUrl: r.thumbnail || imgUrl,
+      author: r.creator ?? null,
+      sourceUrl: r.foreign_landing_url ?? "",
+      meta: `openverse image (${r.license ?? "CC"})`,
+      download: (out) => downloadUrlToFile(imgUrl, out),
+    });
+  }
+  return hits;
+}
+
+/** Wikimedia Commons — encyclopedic stills (great for places, history, objects). */
+async function wikimediaHits(query: string): Promise<FootageHit[]> {
+  const url = new URL("https://commons.wikimedia.org/w/api.php");
+  url.searchParams.set("action", "query");
+  url.searchParams.set("format", "json");
+  url.searchParams.set("generator", "search");
+  url.searchParams.set("gsrsearch", query);
+  url.searchParams.set("gsrnamespace", "6");
+  url.searchParams.set("gsrlimit", "20");
+  url.searchParams.set("prop", "imageinfo");
+  url.searchParams.set("iiprop", "url|size|mime|extmetadata");
+  url.searchParams.set("iiurlwidth", "1600");
+  const resp = await fetch(url, { headers: { "User-Agent": FOOTAGE_UA } });
+  if (!resp.ok) throw new Error(`Wikimedia ${resp.status}`);
+  const data = (await resp.json()) as {
+    query?: { pages?: Record<string, { title?: string; imageinfo?: { url?: string; thumburl?: string; mime?: string; descriptionurl?: string; extmetadata?: Record<string, { value?: string }> }[] }> };
+  };
+  const pages = data.query?.pages ? Object.values(data.query.pages) : [];
+  const hits: FootageHit[] = [];
+  for (const p of pages) {
+    const info = p.imageinfo?.[0];
+    if (!info || !/^image\//.test(info.mime ?? "")) continue; // stills only (Commons video is webm)
+    const full = info.thumburl || info.url;
+    if (!full) continue;
+    hits.push({
+      source: "wikimedia",
+      dedupeId: `wikimedia:${p.title}`,
+      desc: titleWords(p.title || ""),
+      thumbUrl: info.thumburl || full,
+      author: info.extmetadata?.Artist?.value?.replace(/<[^>]+>/g, "").slice(0, 120) ?? null,
+      sourceUrl: info.descriptionurl ?? "",
+      meta: `wikimedia image (${info.extmetadata?.LicenseShortName?.value ?? "CC"})`,
+      download: (out) => downloadUrlToFile(full, out),
+    });
+  }
+  return hits;
+}
+
+/** Internet Archive — vast CC/public-domain VIDEO pool (vintage/educational/news).
+ *  Two-step: search for ids, then pick a small (<80MB) mp4 derivative. */
+async function archiveHits(query: string): Promise<FootageHit[]> {
+  const search = new URL("https://archive.org/advancedsearch.php");
+  search.searchParams.set("q", `(${query.slice(0, 120)}) AND mediatype:(movies)`);
+  search.searchParams.append("fl[]", "identifier");
+  search.searchParams.append("sort[]", "downloads desc");
+  search.searchParams.set("rows", "6");
+  search.searchParams.set("output", "json");
+  const resp = await fetch(search, { headers: { "User-Agent": FOOTAGE_UA } });
+  if (!resp.ok) throw new Error(`archive.org search ${resp.status}`);
+  const data = (await resp.json()) as { response?: { docs?: { identifier?: string }[] } };
+  const docs = (data.response?.docs ?? []).filter((d) => d.identifier).slice(0, 4);
+
+  const hits: FootageHit[] = [];
+  for (const d of docs) {
+    try {
+      const metaResp = await fetch(`https://archive.org/metadata/${encodeURIComponent(d.identifier!)}`, {
+        headers: { "User-Agent": FOOTAGE_UA },
+      });
+      if (!metaResp.ok) continue;
+      const meta = (await metaResp.json()) as {
+        files?: { name?: string; size?: string }[];
+        metadata?: { title?: string; creator?: string; licenseurl?: string };
+      };
+      const mp4 = (meta.files ?? [])
+        .filter((f) => f.name?.toLowerCase().endsWith(".mp4") && Number(f.size || 0) > 0 && Number(f.size) < 80 * 1024 * 1024)
+        .sort((a, b) => Number(a.size) - Number(b.size))[0];
+      if (!mp4?.name) continue;
+      const fileUrl = `https://archive.org/download/${encodeURIComponent(d.identifier!)}/${encodeURIComponent(mp4.name)}`;
+      hits.push({
+        source: "archive",
+        dedupeId: `archive:${d.identifier}`,
+        desc: titleWords(meta.metadata?.title || d.identifier || ""),
+        thumbUrl: `https://archive.org/services/img/${encodeURIComponent(d.identifier!)}`,
+        author: meta.metadata?.creator ?? null,
+        sourceUrl: `https://archive.org/details/${encodeURIComponent(d.identifier!)}`,
+        meta: `archive.org video (${meta.metadata?.licenseurl ? "see item" : "item license"})`,
+        download: (out) => downloadUrlToFile(fileUrl, out),
+      });
+    } catch {
+      // skip this item, keep the rest
+    }
+  }
+  return hits;
+}
+
 /** Query EVERY configured source for one query, pool the normalized hits.
- *  A source that errors is logged and skipped (never fails the whole gather). */
+ *  A source that errors is logged and skipped (never fails the whole gather).
+ *  Sources only run for the kinds they provide: video sources for video scenes,
+ *  image sources for photo scenes. */
 async function gatherHits(
   kind: "video" | "photo",
   query: string,
@@ -744,17 +885,17 @@ async function gatherHits(
   const sources = configuredFootageSources();
   const tasks = sources.map(async (src): Promise<FootageHit[]> => {
     try {
-      if (src === "pexels") {
-        return kind === "video"
-          ? await pexelsVideoHits(query, opts)
-          : await pexelsPhotoHits(query, opts);
+      if (kind === "video") {
+        if (src === "pexels") return await pexelsVideoHits(query, opts);
+        if (src === "pixabay") return await pixabayVideoHits(query, { orientation: opts.orientation, minDuration: opts.minDuration });
+        if (src === "archive") return await archiveHits(query);
+        return []; // image-only source on a video scene
       }
-      if (src === "pixabay") {
-        return kind === "video"
-          ? await pixabayVideoHits(query, { orientation: opts.orientation, minDuration: opts.minDuration })
-          : await pixabayPhotoHits(query, { orientation: opts.orientation });
-      }
-      return [];
+      if (src === "pexels") return await pexelsPhotoHits(query, opts);
+      if (src === "pixabay") return await pixabayPhotoHits(query, { orientation: opts.orientation });
+      if (src === "openverse") return await openverseHits(query);
+      if (src === "wikimedia") return await wikimediaHits(query);
+      return []; // video-only source (archive) on a photo scene
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       log(opts.runId, "debug", `${src} ${kind} search failed for "${query}": ${msg.slice(0, 120)}`, {

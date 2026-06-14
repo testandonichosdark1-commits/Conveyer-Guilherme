@@ -321,7 +321,7 @@ async function runSingleShot(
   // 4b. Text overlays (hook emphasis). Attach a fading caption to the sub-clip
   //     whose time range covers each qualifying scene's spoken token. Scoped to
   //     the first N seconds by default ("hook") — captions everywhere gets noisy.
-  assignTextOverlays(runId, scenes, plans, rangeByScene);
+  const textOverlays = collectTextOverlays(runId, scenes, rangeByScene);
 
   const videoContext = buildVideoContext(scenes);
 
@@ -352,7 +352,6 @@ async function runSingleShot(
             kind: asset.kind,
             startMs: plan.startMs,
             endMs: plan.endMs,
-            overlay: plan.overlay,
           };
         } catch (e) {
           if (e instanceof CancelledError) throw e;
@@ -385,7 +384,7 @@ async function runSingleShot(
 
   // 6. Assemble: silent clips concatenated, global voiceover muxed on top.
   checkCancelled(runId);
-  const finalPath = await assembleSingleShot(runId, inputs, globalAudio.filePath, runDir);
+  const finalPath = await assembleSingleShot(runId, inputs, globalAudio.filePath, runDir, textOverlays);
   updateRun.run("done", finalPath, runId);
   log(runId, "success", "Pipeline complete", { stage: "pipeline", data: { finalPath } });
 
@@ -399,22 +398,22 @@ async function runSingleShot(
 }
 
 /**
- * Attaches hook-emphasis text overlays to sub-clip plans (single-shot path).
+ * Collects hook-emphasis text overlays as ABSOLUTE-timeline captions (single-shot).
  *
- * For each scene carrying an `overlay` token (a striking number / year / place)
- * that qualifies for the configured scope — whole video, or by default only the
- * opening TEXT_OVERLAY_HOOK_SECONDS — the caption is bound to the sub-clip whose
- * [startMs,endMs] range covers the MIDPOINT of that scene's spoken audio. The
- * total is capped so the hook never gets cluttered.
+ * Each scene carrying an `overlay` token (a striking number / year / place) that
+ * falls in scope (the whole video, or by default the opening
+ * TEXT_OVERLAY_HOOK_SECONDS) yields one caption at the token's SPOKEN time (from
+ * Whisper word-alignment). These are burned in ONE final pass at absolute time —
+ * NOT baked into per-clip renders — so they land exactly on the word and can't be
+ * cut short by a clip boundary or drift out of sync. Capped so the hook stays clean.
  */
-function assignTextOverlays(
+function collectTextOverlays(
   runId: string,
   scenes: Scene[],
-  plans: SubClipPlan[],
   rangeByScene: Map<number, SceneAudioRange>
-): void {
+): { text: string; atSec: number }[] {
   const mode = (getSetting("TEXT_OVERLAY_MODE") || "hook").toLowerCase();
-  if (mode === "off") return;
+  if (mode === "off") return [];
   const hookMs = Math.max(0, Number(getSetting("TEXT_OVERLAY_HOOK_SECONDS") || "30")) * 1000;
   const MAX_OVERLAYS = 4;
 
@@ -424,36 +423,22 @@ function assignTextOverlays(
     if (!text) continue;
     const range = rangeByScene.get(scene.index);
     if (!range) continue;
-    // Use the token's actual spoken time (from Whisper word-alignment); fall
-    // back to the scene midpoint only if alignment couldn't place it.
+    // The token's actual spoken time (Whisper word-alignment); midpoint fallback.
     const atMs = range.overlayAtMs ?? (range.startMs + range.endMs) / 2;
     if (mode === "hook" && atMs >= hookMs) continue;
     candidates.push({ text, atMs });
   }
   candidates.sort((a, b) => a.atMs - b.atMs);
   const chosen = candidates.slice(0, MAX_OVERLAYS);
-
-  const applied: string[] = [];
-  for (const ov of chosen) {
-    const plan =
-      plans.find((p) => ov.atMs >= p.startMs && ov.atMs < p.endMs) ??
-      plans.find((p) => ov.atMs >= p.startMs && ov.atMs <= p.endMs);
-    if (plan && !plan.overlay) {
-      // Lead-in: start slightly BEFORE the word so the (now near-instant) pop is
-      // fully up by the word's first sound — Whisper marks word starts a touch
-      // late, so this compensates and makes it feel exactly on the number.
-      plan.overlay = { text: ov.text, atSec: Math.max(0, (ov.atMs - plan.startMs) / 1000 - 0.15) };
-      applied.push(ov.text);
-    }
-  }
-  if (applied.length > 0) {
+  if (chosen.length > 0) {
     log(
       runId,
       "info",
-      `Text overlays: ${applied.length} caption(s) in ${mode === "hook" ? "the hook" : "the whole video"} — ${applied.join(", ")}`,
+      `Text overlays: ${chosen.length} caption(s) in ${mode === "hook" ? "the hook" : "the whole video"} — ${chosen.map((c) => c.text).join(", ")}`,
       { stage: "assemble" }
     );
   }
+  return chosen.map((c) => ({ text: c.text, atSec: c.atMs / 1000 }));
 }
 
 /**

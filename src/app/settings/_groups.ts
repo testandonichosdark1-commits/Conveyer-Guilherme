@@ -165,8 +165,14 @@ export const ALL_GROUPS: Group[] = [
       {
         key: "FOOTAGE_SOURCES",
         label: "Footage sources",
-        desc: "Which stock libraries to search, comma-separated. The app queries ALL of them for each scene, pools every result together, and picks the best match — so more sources = better odds the exact shot exists. Supported: pexels, pixabay (each needs its API key set in 'Required API Keys'; a source with no key is silently skipped).",
-        examples: "pexels,pixabay (default)  ·  pexels (Pexels only)",
+        desc: "Which libraries to search, comma-separated. The app queries ALL of them for each scene, pools every result, and the AI picks the best match — so more sources = better odds the right shot exists.\n\n• pexels, pixabay — video + photos, NO attribution needed (each needs its API key above; a keyless source is skipped).\n• openverse, wikimedia — huge CC IMAGE libraries (no key needed). They make 'photo' scenes much more accurate, BUT their images are Creative-Commons and REQUIRE crediting the author in your video description — the run log prints the author + source + license for every clip used.\n• archive — Internet-Archive CC video (opt-in; vintage/news/educational). Add it only if you want older footage.",
+        examples: "pexels,pixabay,openverse,wikimedia (default)  ·  pexels,pixabay (no-attribution only)  ·  add ',archive' for vintage video",
+      },
+      {
+        key: "OPENVERSE_TOKEN",
+        label: "Openverse token (optional)",
+        desc: "Optional. A free Openverse API token just raises the rate limit — Openverse works without it (anonymous). Only worth setting if you make a lot of videos and hit Openverse rate limits. Get one at api.openverse.org.",
+        examples: "Leave empty unless you hit Openverse rate limits",
       },
       {
         key: "FOOTAGE_AI_PICK",

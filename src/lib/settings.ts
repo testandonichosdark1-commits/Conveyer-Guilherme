@@ -34,7 +34,8 @@ export const SETTING_KEYS = [
   "MAX_PAUSE_SECONDS",       // single-shot: cap every silence in the continuous voiceover to this many seconds (tames over-long pauses between sentences / at chunk seams). 0 = off.
 
   // ── Stock footage (multi-source) ──────────────────────────────────
-  "FOOTAGE_SOURCES",           // comma list of libraries to query, in order. Default "pexels,pixabay".
+  "FOOTAGE_SOURCES",           // comma list of libraries: pexels,pixabay (video+photo) · openverse,wikimedia (CC images) · archive (CC video, opt-in). Default "pexels,pixabay,openverse,wikimedia".
+  "OPENVERSE_TOKEN",           // optional Openverse bearer token (raises rate limits). Empty works (anonymous).
   "FOOTAGE_AI_PICK",           // on (default) | off — let Gemini LOOK AT each candidate thumbnail and pick the best match. Relevance bar is hardcoded (80% → cascades to 70/60/50, then best-available). off = local text-match score only.
   "STOCK_FOOTAGE_ORIENTATION", // landscape | portrait | square
   "STOCK_FOOTAGE_MAX_HEIGHT",  // 720 | 1080 | 2160 — caps file size
@@ -164,9 +165,11 @@ export const DEFAULTS: Record<SettingKey, string> = {
   MAX_PAUSE_SECONDS: "0.6",
 
   // Stock footage (Pexels) — defaults match a typical long-form 16:9 channel.
-  // Query Pexels + Pixabay (both video+photo, no attribution). Add a key for
-  // each you want; a source with no key is silently skipped.
-  FOOTAGE_SOURCES: "pexels,pixabay",
+  // Query Pexels + Pixabay (video+photo, no attribution) AND Openverse +
+  // Wikimedia (CC images — attribution required, printed in the run log). Add
+  // "archive" for Internet-Archive CC video. A source with no key is skipped.
+  FOOTAGE_SOURCES: "pexels,pixabay,openverse,wikimedia",
+  OPENVERSE_TOKEN: "",
   // Gemini LOOKS AT each candidate's thumbnail and scores how well it fits the
   // scene + whole-video context; the best ≥80% wins (cascades 80→70→60→50, then
   // best-available — a scene never fails). off = local text-match score only.

@@ -361,6 +361,88 @@ function withOverlay(
   return dt ? `${videoFilter},${dt}` : videoFilter;
 }
 
+/** A caption + the ABSOLUTE time (s, on the final timeline) it should appear. */
+export interface TimedOverlay {
+  text: string;
+  atSec: number;
+}
+
+/** drawtext for ONE caption at an ABSOLUTE timeline position (final-pass burn).
+ *  Fixed ~2s readable hold, snappy pop-in, gentle fade-out. null if unusable. */
+function absoluteOverlayDrawtext(text: string, atSec: number, h: number): string | null {
+  const t = sanitizeOverlayText(text);
+  if (!t) return null;
+  const font = resolveOverlayFont();
+  if (!font) return null;
+
+  const lead = 0.12; // start a touch before the word (Whisper marks starts late)
+  const t0 = Math.max(0, atSec - lead);
+  const SHOW = 2.0; // guaranteed readable on-screen time
+  const t1 = t0 + SHOW;
+  const fadeIn = 0.1;
+  const fadeOut = 0.4;
+  const f = (n: number) => n.toFixed(2);
+
+  const alpha =
+    `if(lt(t,${f(t0)}),0,` +
+    `if(lt(t,${f(t0 + fadeIn)}),(t-${f(t0)})/${f(fadeIn)},` +
+    `if(lt(t,${f(t1 - fadeOut)}),1,` +
+    `if(lt(t,${f(t1)}),(${f(t1)}-t)/${f(fadeOut)},0))))`;
+
+  const fontSize = Math.max(28, Math.round(h / 10));
+  const borderW = Math.max(2, Math.round(fontSize / 16));
+  return (
+    `drawtext=fontfile='${escapeFilterPath(font)}'` +
+    `:text='${t}':expansion=none` +
+    `:fontcolor=white:fontsize=${fontSize}` +
+    `:borderw=${borderW}:bordercolor=black@0.9` +
+    `:shadowx=2:shadowy=2:shadowcolor=black@0.5` +
+    `:x=(w-text_w)/2:y=h*0.74` +
+    `:alpha='${alpha}':enable='between(t,${f(t0)},${f(t1)})'`
+  );
+}
+
+/**
+ * Burns hook captions onto a finished video in ONE pass at ABSOLUTE timeline
+ * positions. Each lands exactly when its word is spoken and stays up a full
+ * readable ~2s — independent of clip boundaries or per-clip duration drift (the
+ * old per-clip baking made captions flash for a few frames and slide early).
+ * Audio is stream-copied. If there's no usable font/caption the input is copied
+ * through unchanged — captions never block or fail a render.
+ */
+export async function burnOverlays(
+  inPath: string,
+  outPath: string,
+  overlays: TimedOverlay[],
+  h: number
+): Promise<void> {
+  ensureFfmpegPaths();
+  const filters = overlays
+    .map((o) => absoluteOverlayDrawtext(o.text, o.atSec, h))
+    .filter((x): x is string => !!x);
+  if (filters.length === 0) {
+    fs.copyFileSync(inPath, outPath);
+    return;
+  }
+  const vf = filters.join(",");
+  await new Promise<void>((resolve, reject) => {
+    ffmpeg()
+      .input(inPath)
+      .videoFilters(vf)
+      .outputOptions([
+        "-c:v libx264",
+        "-preset veryfast",
+        "-crf 20",
+        "-pix_fmt yuv420p",
+        "-c:a copy",
+        "-movflags +faststart",
+      ])
+      .on("error", reject)
+      .on("end", () => resolve())
+      .save(outPath);
+  });
+}
+
 /**
  * Ken-Burns clip: still image with a slow zoom plus optional gentle pan.
  */
@@ -742,7 +824,8 @@ export async function assembleSingleShot(
   runId: string,
   inputs: SingleShotInput[],
   globalAudioPath: string,
-  outDir: string
+  outDir: string,
+  overlays: TimedOverlay[] = []
 ): Promise<string> {
   ensureFfmpegPaths();
 
@@ -801,6 +884,24 @@ export async function assembleSingleShot(
   // 3. Mux the global voiceover onto the silent concat.
   const finalPath = path.join(outDir, "final.mp4");
   await muxAudioOntoVideo(silentConcat, globalAudioPath, finalPath);
+
+  // 3b. Burn hook captions in ONE final pass at absolute timeline positions
+  //     (exact timing + guaranteed readable hold; never baked into clips).
+  if (overlays.length > 0) {
+    const withText = path.join(outDir, "final_text.mp4");
+    try {
+      await burnOverlays(finalPath, withText, overlays, h);
+      fs.rmSync(finalPath, { force: true });
+      fs.renameSync(withText, finalPath);
+      log(runId, "info", `Burned ${overlays.length} text caption(s) onto the final video`, { stage: "assemble" });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      log(runId, "warn", `Text caption burn failed (video kept without captions): ${msg.slice(0, 150)}`, {
+        stage: "assemble",
+      });
+      try { fs.rmSync(withText, { force: true }); } catch {}
+    }
+  }
   log(runId, "success", `Final video: ${finalPath}`, { stage: "assemble" });
 
   // 4. Clean up the intermediate silent concat.
