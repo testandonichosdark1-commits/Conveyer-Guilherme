@@ -943,10 +943,12 @@ function broadenQuery(query: string, level: number): string {
 /**
  * VISION relevance — Gemini LOOKS AT each candidate's thumbnail (not its text)
  * and scores 0..1 how well the IMAGE fits (a) this scene's narration moment and
- * (b) the whole video's context. One call, up to `MAX` thumbnails attached.
- * Returns scores per hit, or null when disabled / no key / no usable thumbnails
- * / any error — the caller then falls back to the local text score, so a run is
- * NEVER blocked by the vision step.
+ * (b) the whole video's context. Judges EVERY candidate, in batches of ≤BATCH
+ * thumbnails per call (Gemini caps images-per-request), merging the scores — up
+ * to a HARD_CEIL safety bound so a huge pool can't blow up payload/cost. Returns
+ * a dedupeId→score map (empty entries fall back to the local text score in the
+ * caller), or null when disabled / no key / no usable thumbnails. A batch that
+ * errors is skipped (its candidates fall back) — the run is NEVER blocked.
  */
 async function aiScoreHitsByVision(
   runId: string,
@@ -958,33 +960,35 @@ async function aiScoreHitsByVision(
   const apiKey = getSetting("GOOGLE_API_KEY").trim();
   if (!apiKey) return null;
 
-  const MAX = 10;
-  const subset = hits.filter((h) => h.thumbUrl).slice(0, MAX);
-  if (subset.length === 0) return null;
+  const HARD_CEIL = 40; // most candidates Vision will judge for one scene/attempt
+  const BATCH = 12; // thumbnails per Gemini call (safe for images-per-request)
+  const withThumb = hits.filter((h) => h.thumbUrl).slice(0, HARD_CEIL);
+  if (withThumb.length === 0) return null;
 
-  const thumbs = await Promise.all(subset.map((h) => fetchThumbInline(h.thumbUrl)));
-  const usable = subset
+  const thumbs = await Promise.all(withThumb.map((h) => fetchThumbInline(h.thumbUrl)));
+  const usable = withThumb
     .map((h, i) => ({ h, t: thumbs[i] }))
     .filter((x): x is { h: FootageHit; t: { data: string; mime: string } } => x.t !== null);
   if (usable.length === 0) return null;
 
-  const parts: unknown[] = [
-    {
-      text:
-        `You are choosing B-roll footage for ONE moment of a video.\n` +
-        (videoContext ? `The whole video is about: "${videoContext.slice(0, 300)}".\n` : "") +
-        `This moment's narration: "${sceneText.slice(0, 300)}".\n\n` +
-        `${usable.length} candidate images follow, each labelled "index N". LOOK AT EACH IMAGE and score 0-100 how well what is ACTUALLY SHOWN fits this moment AND the video's overall context (100 = perfect on-screen match). Judge only by the visible content, not by any text.\n` +
-        `Return STRICTLY a JSON array [{"i":<N>,"score":<int>}] covering all ${usable.length}. No markdown.`,
-    },
-  ];
-  usable.forEach((x, i) => {
-    parts.push({ text: `index ${i}` });
-    parts.push({ inlineData: { mimeType: x.t.mime, data: x.t.data } });
-  });
+  const model = getSetting("SCENE_SPLIT_MODEL") || "gemini-flash-latest";
+  const result = new Map<string, number>();
 
-  try {
-    const model = getSetting("SCENE_SPLIT_MODEL") || "gemini-flash-latest";
+  const scoreBatch = async (batch: { h: FootageHit; t: { data: string; mime: string } }[]) => {
+    const parts: unknown[] = [
+      {
+        text:
+          `You are choosing B-roll footage for ONE moment of a video.\n` +
+          (videoContext ? `The whole video is about: "${videoContext.slice(0, 300)}".\n` : "") +
+          `This moment's narration: "${sceneText.slice(0, 300)}".\n\n` +
+          `${batch.length} candidate images follow, each labelled "index N". LOOK AT EACH IMAGE and score 0-100 how well what is ACTUALLY SHOWN fits this moment AND the video's overall context (100 = perfect on-screen match). Judge only by the visible content, not by any text.\n` +
+          `Return STRICTLY a JSON array [{"i":<N>,"score":<int>}] covering all ${batch.length}. No markdown.`,
+      },
+    ];
+    batch.forEach((x, i) => {
+      parts.push({ text: `index ${i}` });
+      parts.push({ inlineData: { mimeType: x.t.mime, data: x.t.data } });
+    });
     const r = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`,
       {
@@ -1000,18 +1004,23 @@ async function aiScoreHitsByVision(
     const j = (await r.json()) as { candidates?: { content?: { parts?: { text?: string }[] } }[] };
     const text = j.candidates?.[0]?.content?.parts?.map((p) => p.text ?? "").join("") ?? "";
     const arr = JSON.parse(text.match(/\[[\s\S]*\]/)?.[0] ?? text) as { i: number; score: number }[];
-    const byDedupe = new Map<string, number>();
-    for (const x of arr) {
-      const u = usable[Number(x.i)];
-      if (u) byDedupe.set(u.h.dedupeId, Math.max(0, Math.min(100, Number(x.score))) / 100);
+    for (const a of arr) {
+      const u = batch[Number(a.i)];
+      if (u) result.set(u.h.dedupeId, Math.max(0, Math.min(100, Number(a.score))) / 100);
     }
-    return byDedupe.size > 0 ? byDedupe : null;
-  } catch (e) {
-    log(runId, "debug", `Vision scoring unavailable (fallback to text score): ${(e as Error).message.slice(0, 100)}`, {
-      stage: "animate",
-    });
-    return null;
+  };
+
+  // Judge ALL candidates, one batch (call) at a time. A failed batch is skipped.
+  for (let i = 0; i < usable.length; i += BATCH) {
+    try {
+      await scoreBatch(usable.slice(i, i + BATCH));
+    } catch (e) {
+      log(runId, "debug", `Vision batch ${i / BATCH + 1} failed (those fall back to text): ${(e as Error).message.slice(0, 90)}`, {
+        stage: "animate",
+      });
+    }
   }
+  return result.size > 0 ? result : null;
 }
 
 interface PoolHit {
@@ -1105,12 +1114,13 @@ async function acquireFootage(
     }
     hits.forEach((h) => seen.add(h.dedupeId));
 
-    // Local text score — used to pre-pick which thumbnails to send to vision,
-    // and as the fallback score when vision is unavailable.
+    // Local text score — only ORDERS candidates (Vision judges ALL of them, with
+    // a safety cap inside aiScoreHitsByVision) and is the fallback score when
+    // Vision is unavailable.
     const localScored = hits
       .map((h) => ({ hit: h, local: relevanceScore(relevanceTokens(h.desc), queryTokenLists) }))
       .sort((a, b) => b.local - a.local);
-    const toScore = localScored.slice(0, 10).map((x) => x.hit);
+    const toScore = localScored.map((x) => x.hit);
 
     const vision = await aiScoreHitsByVision(runId, scene.text, videoContext, toScore);
     for (const x of localScored) {
