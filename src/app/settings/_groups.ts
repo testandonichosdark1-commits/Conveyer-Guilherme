@@ -90,9 +90,9 @@ export const ALL_GROUPS: Group[] = [
     fields: [
       {
         key: "TTS_PROVIDER",
-        label: "Voice engine — ai33pro / 69labs / kokoro",
-        desc: "Which service + model generates the voice.\n\n• 'ai33pro' (default) — ElevenLabs voice via the ai33.pro proxy. Uses the ai33.pro key below.\n\n• '69labs' — the SAME ElevenLabs voice through the 69labs gateway. Uses the 69labs key below.\n\n• 'kokoro' — the Kokoro model on ai33.pro: ~50% cheaper, but a DIFFERENT voice set (NOT ElevenLabs). Uses the ai33.pro key. When you pick kokoro, set the voice field below to a Kokoro voice (e.g. af_heart).\n\nModel id / similarity don't apply to kokoro; speed DOES. SMART: if you fill only ONE of the ai33.pro / 69labs keys, ai33pro vs 69labs is auto-picked. Whichever engine ends up active is printed in the run log.",
-        examples: "ai33pro (default)  ·  69labs  ·  kokoro (cheaper, Kokoro voices)",
+        label: "Voice engine — ai33pro / 69labs / kokoro / minimax",
+        desc: "Which service generates the voice.\n\n• 'ai33pro' (default) — ElevenLabs voice via the ai33.pro proxy. Uses the ai33.pro key below.\n\n• '69labs' — the SAME ElevenLabs voice through the 69labs gateway. Uses the 69labs key below.\n\n• 'kokoro' — the Kokoro model on ai33.pro (~50% cheaper, its own voices). Uses the ai33.pro key.\n\n• 'minimax' — MiniMax's OWN official API, DIRECT (does not go through ai33.pro — use this if ai33.pro is flaky). Its own voices. Needs the MiniMax key + Group ID below.\n\nWhen you switch engine, set the voice field below to that engine's kind of voice. Whichever engine ends up active is printed in the run log.",
+        examples: "ai33pro (default)  ·  69labs  ·  kokoro  ·  minimax (direct, bypasses ai33.pro)",
       },
       {
         key: "AI33PRO_API_KEY",
@@ -107,6 +107,24 @@ export const ALL_GROUPS: Group[] = [
         examples: "vk_xxxxxxxxxxxxxxxx — from https://69labs.vip dashboard → API",
       },
       {
+        key: "MINIMAX_API_KEY",
+        label: "MiniMax key (for the minimax engine)",
+        desc: "MiniMax official API key — fill this ONLY if Voice engine = minimax. This calls MiniMax DIRECTLY (not through ai33.pro), so it's unaffected when ai33.pro is down. Get it from your MiniMax account → API keys.",
+        examples: "From platform.minimax.io → API key",
+      },
+      {
+        key: "MINIMAX_GROUP_ID",
+        label: "MiniMax Group ID",
+        desc: "Your MiniMax Group ID (next to the API key in the MiniMax dashboard). Some MiniMax accounts/regions require it, others don't — paste it to be safe; it's used only by the minimax engine. Leave empty if your account doesn't show one.",
+        examples: "A numeric/string id from the same MiniMax dashboard page as the key",
+      },
+      {
+        key: "MINIMAX_MODEL",
+        label: "MiniMax model",
+        desc: "Which MiniMax voice model to use (minimax engine only). 'speech-02-hd' is a good high-quality default. '-turbo' variants are faster/cheaper; higher numbers (2.6, 2.8) are newer.",
+        examples: "speech-02-hd (default)  ·  speech-02-turbo  ·  speech-2.6-hd",
+      },
+      {
         key: "TTS_MODE",
         label: "Voice mode",
         desc: "How the narration is recorded.\n\n• 'single-shot' (recommended) records the WHOLE script in one continuous take, so the voice flows naturally and a sentence is never split in half when one scene ends and the next begins. Needs the Groq API key above.\n\n• 'per-scene' records each scene separately (the older way). Pick this only if you don't want to set up a Groq key — but expect a small pause at every scene change.",
@@ -114,9 +132,9 @@ export const ALL_GROUPS: Group[] = [
       },
       {
         key: "TTS_VOICE_ID",
-        label: "Voice id (ElevenLabs or Kokoro)",
-        desc: "The narration voice. WHICH kind depends on the engine above:\n\n• ai33pro / 69labs (ElevenLabs) → an ElevenLabs voice id like KeU8nqWFDbaoi0QVUjD3. Paste just the ID; the ai33.pro dashboard shows them as 'elevenlabs_<id>' and the app strips that prefix for you.\n\n• kokoro → a Kokoro voice name like af_heart, am_adam, af_bella (af_ = female, am_ = male). The app adds the 'kokoro_' prefix automatically. Leave blank and it defaults to af_heart.\n\nA wrong id makes the service fall back to a DEFAULT voice (output won't match what you picked).",
-        examples: "ElevenLabs: KeU8nqWFDbaoi0QVUjD3  ·  Kokoro: af_heart, am_adam, af_bella",
+        label: "Voice id (depends on the engine)",
+        desc: "The narration voice. WHICH kind depends on the engine above — when you switch engine, change this too:\n\n• ai33pro / 69labs (ElevenLabs) → an ElevenLabs voice id like KeU8nqWFDbaoi0QVUjD3. Paste just the ID; the ai33.pro dashboard shows them as 'elevenlabs_<id>' and the app strips that prefix for you.\n\n• kokoro → a Kokoro voice name like af_heart, am_adam, af_bella (af_ = female, am_ = male). The app adds the 'kokoro_' prefix. Blank → af_heart.\n\n• minimax → a MiniMax voice name like English_Graceful_Lady, English_Persuasive_Man, English_Insightful_Speaker. Blank → English_Graceful_Lady.\n\nA wrong id makes the service fall back to a DEFAULT voice (output won't match what you picked).",
+        examples: "ElevenLabs: KeU8nqWFDbaoi0QVUjD3  ·  Kokoro: af_heart  ·  MiniMax: English_Graceful_Lady",
       },
       {
         key: "TTS_MODEL",

@@ -6,6 +6,7 @@ import { log } from "../logger";
 import type { Scene } from "./scene-split";
 import { createTtsTask, pollTask, downloadTask } from "./ai33pro";
 import { createV3SpeechTask, pollV3Task, downloadV3Task } from "./ai33pro";
+import { synthesizeMinimax } from "./minimax";
 import { createTtsJob, pollJob, downloadJob } from "./labs69";
 import { probeDurationSafe, applyAudioTempo, resolveFfmpegBinary } from "./video-assemble";
 
@@ -42,10 +43,19 @@ type TtsOptions = Record<string, never>;
  * If both keys are set, TTS_PROVIDER is respected. Exported so the pipeline can
  * show the user which engine is live.
  */
-export function resolveTtsProvider(): "ai33pro" | "69labs" | "kokoro" {
+export function resolveTtsProvider(): "ai33pro" | "69labs" | "kokoro" | "minimax" {
   const selected = (getSetting("TTS_PROVIDER") || "ai33pro").toLowerCase();
   const hasAi33 = getSetting("AI33PRO_API_KEY").trim().length > 0;
   const has69 = getSetting("LABS69_API_KEY").trim().length > 0;
+  const hasMinimax = getSetting("MINIMAX_API_KEY").trim().length > 0;
+  if (selected === "minimax") {
+    // MiniMax uses its own key. If it's missing, fall back to a configured engine
+    // so narration still works; otherwise stay (a clear key error surfaces later).
+    if (hasMinimax) return "minimax";
+    if (hasAi33) return "ai33pro";
+    if (has69) return "69labs";
+    return "minimax";
+  }
   if (selected === "kokoro") {
     // Kokoro runs on the ai33.pro key (it's the ai33.pro V3 API). If that key is
     // missing but 69labs is set, fall back so narration still works; otherwise
@@ -74,6 +84,8 @@ async function dispatchTts(
     await labs69Tts(runId, text, outPath);
   } else if (provider === "kokoro") {
     await kokoroTts(runId, text, outPath);
+  } else if (provider === "minimax") {
+    await minimaxTts(runId, text, outPath);
   } else {
     await ai33proTts(runId, text, outPath);
   }
@@ -227,6 +239,24 @@ function resolveKokoroVoiceId(raw: string): string {
   v = v.replace(/^(elevenlabs_|minimax_|clone_|edge_)/i, "");
   if (!/^kokoro_/i.test(v)) v = `kokoro_${v}`;
   return v;
+}
+
+/**
+ * MiniMax TTS via the DIRECT official API (bypasses the ai33.pro proxy entirely
+ * — used when that proxy is flaky). MiniMax has its OWN voices (e.g.
+ * "English_Graceful_Lady") — NOT ElevenLabs ids — and a NATIVE speed (0.5–2.0),
+ * so TTS_SPEED is passed in-request and we do NOT run atempo. Needs MINIMAX_API_KEY
+ * (and MINIMAX_GROUP_ID if the account requires it).
+ */
+async function minimaxTts(runId: string, text: string, outPath: string): Promise<void> {
+  const voiceId = (getSetting("TTS_VOICE_ID") || "").trim() || "English_Graceful_Lady";
+  const model = getSetting("MINIMAX_MODEL") || "speech-02-hd";
+  const speedRaw = parseFloat(getSetting("TTS_SPEED") || "1");
+  const speed = Number.isFinite(speedRaw) ? clamp(speedRaw, 0.5, 2) : 1;
+
+  log(runId, "debug", `MiniMax TTS (${model} / ${voiceId}, speed=${speed})`, { stage: "tts" });
+  await synthesizeMinimax(text, outPath, { voiceId, model, speed });
+  // NOTE: no applyAudioTempo — speed is native (voice_setting.speed above).
 }
 
 /**

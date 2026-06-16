@@ -22,8 +22,11 @@ export const SETTING_KEYS = [
   "VIDEO_CONTEXT",           // optional 1–2 sentence channel/setting hint, injected into scene-split as background DATA (never as commands). Capped ~300 chars. Empty = setting inferred automatically from the script.
 
   // ── Text-to-Speech (ai33.pro / ElevenLabs voices) ─────────────────
-  "TTS_PROVIDER",            // voiceover engine: ai33pro (default) | 69labs. Both serve the SAME ElevenLabs voices; 69labs is just an alternate gateway.
+  "TTS_PROVIDER",            // voiceover engine: ai33pro (default, ElevenLabs voices) | 69labs (ElevenLabs) | kokoro (ai33.pro Kokoro) | minimax (DIRECT MiniMax official API, own voices).
   "LABS69_API_KEY",          // 69labs API key (vk_...). Only needed when TTS_PROVIDER = 69labs.
+  "MINIMAX_API_KEY",         // MiniMax direct T2A API key (Bearer). Only needed when TTS_PROVIDER = minimax.
+  "MINIMAX_GROUP_ID",        // MiniMax GroupId — required on some accounts/regions; appended as ?GroupId= when set.
+  "MINIMAX_MODEL",           // MiniMax TTS model, e.g. speech-02-hd.
   "TTS_VOICE_PROVIDER",      // 69labs path only: elevenlabs (default) | edgetts | voice-clone. We use elevenlabs so the voice matches ai33pro.
   "TTS_VOICE_ID",            // ElevenLabs voice id (path-segment in ai33pro URL; also used by 69labs-elevenlabs)
   "TTS_MODEL",               // ElevenLabs model, e.g. eleven_multilingual_v2
@@ -144,6 +147,10 @@ export const DEFAULTS: Record<SettingKey, string> = {
   // ElevenLabs voices through the 69labs gateway (needs LABS69_API_KEY).
   TTS_PROVIDER: "ai33pro",
   LABS69_API_KEY: "",
+  // MiniMax direct API (bypasses ai33.pro). Empty until you switch to minimax.
+  MINIMAX_API_KEY: "",
+  MINIMAX_GROUP_ID: "",
+  MINIMAX_MODEL: "speech-02-hd",
   // 69labs path only — elevenlabs keeps the voice identical to ai33pro.
   TTS_VOICE_PROVIDER: "elevenlabs",
   TTS_VOICE_ID: "",
