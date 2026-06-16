@@ -91,6 +91,11 @@ export async function synthesizeMinimax(text: string, outPath: string, opts: Min
   if (!hex) {
     throw new Error(`MiniMax T2A returned no audio (base_resp: ${JSON.stringify(json.base_resp)})`);
   }
+  // Buffer.from(hex,"hex") silently truncates at the first invalid nibble, which
+  // would write a corrupt mp3 that only fails later in ffmpeg. Validate first.
+  if (hex.length % 2 !== 0 || !/^[0-9a-fA-F]+$/.test(hex)) {
+    throw new Error("MiniMax T2A: audio field is not valid hex (truncated/garbled response)");
+  }
   const buf = Buffer.from(hex, "hex");
   if (buf.byteLength === 0) throw new Error("MiniMax T2A: decoded audio is empty");
   fs.writeFileSync(outPath, buf);

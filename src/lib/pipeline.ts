@@ -47,15 +47,23 @@ export async function runPipeline(runId: string, script: string) {
     //     wastes hundreds of TTS jobs and then fails at the end (the "audio but
     //     no visuals" failure). Fail fast + clear instead.
     checkCancelled(runId);
-    try {
-      await pexelsPreflight(runId);
-      log(runId, "info", "Pexels check OK — stock footage is reachable", { stage: "pipeline" });
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      throw new Error(
-        `Pexels pre-flight failed — aborting before any voiceovers are generated (saves your TTS credits). ` +
-          `Cause: ${msg}. Fix: open Settings and confirm PEXELS_API_KEY is set and valid, then run again.`
-      );
+    // Only pre-flight Pexels when a Pexels key is actually configured. With
+    // multiple footage sources a user may run Pixabay/Openverse/Wikimedia only
+    // (no Pexels key) — that must NOT abort the run. Per-source failures are
+    // handled gracefully later (each source is tried independently).
+    if (getSetting("PEXELS_API_KEY").trim()) {
+      try {
+        await pexelsPreflight(runId);
+        log(runId, "info", "Pexels check OK — stock footage is reachable", { stage: "pipeline" });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        throw new Error(
+          `Pexels pre-flight failed — aborting before any voiceovers are generated (saves your TTS credits). ` +
+            `Cause: ${msg}. Fix: open Settings and confirm PEXELS_API_KEY is set and valid, then run again.`
+        );
+      }
+    } else {
+      log(runId, "info", "No Pexels key set — skipping Pexels pre-flight (using the other footage sources)", { stage: "pipeline" });
     }
 
     // 1c. SINGLE-SHOT VOICEOVER MODE (default). One continuous voiceover is
@@ -379,6 +387,28 @@ async function runSingleShot(
     throw new Error(
       "No scenes succeeded — every Pexels fetch failed. See the failure breakdown above for the cause " +
         "(most often: PEXELS_API_KEY missing/invalid, or all Pexels keys rate-limited)."
+    );
+  }
+
+  // 5b. Re-stitch survivors so the silent clips still tile the FULL audio
+  //     timeline. The clips are concatenated end-to-end and the global voiceover
+  //     is muxed over the whole thing, so a DROPPED sub-clip (failed fetch) must
+  //     have its time slot absorbed by the previous survivor — otherwise every
+  //     later clip shifts earlier and the back half of the video drifts out of
+  //     sync with the narration. (inputs are already in ascending time order.)
+  const droppedCount = plans.length - inputs.length;
+  if (droppedCount > 0) {
+    const totalMs = Math.round(globalAudio.durationSec * 1000);
+    const origStarts = inputs.map((x) => x.startMs);
+    for (let i = 0; i < inputs.length; i++) {
+      inputs[i].startMs = i === 0 ? 0 : origStarts[i];
+      inputs[i].endMs = i === inputs.length - 1 ? totalMs : origStarts[i + 1];
+    }
+    log(
+      runId,
+      "info",
+      `${droppedCount} sub-clip(s) failed — re-stitched the timeline so the voiceover stays in sync (neighbours absorb the gaps)`,
+      { stage: "pipeline" }
     );
   }
 
