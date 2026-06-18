@@ -17,7 +17,7 @@ import { log, type LogLevel } from "../logger";
 
 const BASE = "https://api.ai33.pro/v1";
 const POLL_INTERVAL_MS = 2500;
-const POLL_MAX_MS = 15 * 60 * 1000;
+const DEFAULT_POLL_MAX_MINUTES = 45;
 const DEFAULT_TIMEOUT_MS = 120_000;
 const DOWNLOAD_TIMEOUT_MS = 5 * 60_000;
 
@@ -27,6 +27,13 @@ function getKey(): string {
   const k = getSetting("AI33PRO_API_KEY").trim();
   if (!k) throw new Error("AI33PRO_API_KEY is not set (Settings)");
   return k;
+}
+
+function getPollMaxMs(): number {
+  const raw = Number(getSetting("AI33PRO_POLL_MAX_MINUTES") || "");
+  const minutes = Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_POLL_MAX_MINUTES;
+  // Guardrail: allow long MiniMax jobs but avoid accidental 9999-minute hangs.
+  return Math.max(1, Math.min(240, minutes)) * 60 * 1000;
 }
 
 function authHeaders(): Record<string, string> {
@@ -143,11 +150,12 @@ function resolveAudioUrl(task: TaskInfo): string | null {
 
 export async function pollTask(taskId: string, runId: string, stage: string = "tts"): Promise<TaskInfo> {
   const startedAt = Date.now();
+  const pollMaxMs = getPollMaxMs();
   let lastStatus: TaskStatus | null = null;
 
   while (true) {
-    if (Date.now() - startedAt > POLL_MAX_MS) {
-      throw new Error(`ai33pro polling timeout (${POLL_MAX_MS / 1000}s) — task ${taskId}`);
+    if (Date.now() - startedAt > pollMaxMs) {
+      throw new Error(`ai33pro polling timeout (${Math.round(pollMaxMs / 60000)} min) — task ${taskId}`);
     }
 
     let task: TaskInfo;
@@ -332,11 +340,12 @@ export async function getV3Task(taskId: string): Promise<V3TaskInfo> {
 
 export async function pollV3Task(taskId: string, runId: string, stage: string = "tts"): Promise<V3TaskInfo> {
   const startedAt = Date.now();
+  const pollMaxMs = getPollMaxMs();
   let lastStatus: TaskStatus | null = null;
 
   while (true) {
-    if (Date.now() - startedAt > POLL_MAX_MS) {
-      throw new Error(`ai33pro V3 polling timeout (${POLL_MAX_MS / 1000}s) — task ${taskId}`);
+    if (Date.now() - startedAt > pollMaxMs) {
+      throw new Error(`ai33pro V3 polling timeout (${Math.round(pollMaxMs / 60000)} min) — task ${taskId}`);
     }
     let task: V3TaskInfo;
     try {
