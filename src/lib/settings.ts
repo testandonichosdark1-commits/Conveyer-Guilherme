@@ -30,6 +30,7 @@ export const SETTING_KEYS = [
   "MINIMAX_API_KEY",         // MiniMax direct T2A API key
   "MINIMAX_GROUP_ID",        // MiniMax GroupId
   "MINIMAX_MODEL",           // MiniMax TTS model, e.g. speech-02-hd
+  "AI33PRO_POLL_MAX_MINUTES", // max minutes to wait for one ai33.pro TTS task before timing out
   "TTS_VOICE_PROVIDER",      // 69labs path only: elevenlabs | edgetts | voice-clone
   "TTS_VOICE_ID",            // narration voice id/name
   "TTS_MODEL",               // ElevenLabs model, e.g. eleven_multilingual_v2
@@ -191,6 +192,7 @@ export const DEFAULTS: Record<SettingKey, string> = {
   MINIMAX_API_KEY: "",
   MINIMAX_GROUP_ID: "",
   MINIMAX_MODEL: "speech-02-hd",
+  AI33PRO_POLL_MAX_MINUTES: "45",
   TTS_VOICE_PROVIDER: "elevenlabs",
   TTS_VOICE_ID: "",
   TTS_MODEL: "eleven_multilingual_v2",
