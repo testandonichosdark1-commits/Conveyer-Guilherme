@@ -6,9 +6,9 @@ import db from "./db";
  */
 export const SETTING_KEYS = [
   // ── Required API keys ─────────────────────────────────────────────
-  "GOOGLE_API_KEY",          // Gemini — scene splitting
+  "GOOGLE_API_KEY",          // Gemini — scene splitting and Gemini Vision scoring
   "PEXELS_API_KEY",          // Pexels — stock b-roll
-  "PIXABAY_API_KEY",         // Pixabay — second stock source (video+photo, no attribution). Optional; empty = Pexels only.
+  "PIXABAY_API_KEY",         // Pixabay — second stock source (video+photo). Optional; empty = Pexels only.
   "AI33PRO_API_KEY",         // ai33.pro — ElevenLabs voices proxy
   "GROQ_API_KEY",            // Groq Whisper — word-level transcription for single-shot voiceover mode
 
@@ -21,80 +21,87 @@ export const SETTING_KEYS = [
   "SCENE_SPLIT_PROVIDER",    // gemini (default) | openai
   "SCENE_SPLIT_MODEL",       // e.g. gemini-flash-latest, deepseek-chat, gpt-4o-mini
   "OPENAI_API_KEY",          // custom API key (for DeepSeek, OpenAI, OpenRouter, etc.)
-  "OPENAI_BASE_URL",         // custom base URL (e.g. https://api.deepseek.com/v1)
-  "VIDEO_CONTEXT",           // optional 1–2 sentence channel/setting hint, injected into scene-split as background DATA (never as commands). Capped ~300 chars. Empty = setting inferred automatically from the script.
+  "OPENAI_BASE_URL",         // custom base URL (e.g. https://api.deepseek.com)
+  "VIDEO_CONTEXT",           // optional short channel/setting hint injected into scene split and footage scoring
 
-  // ── Text-to-Speech (ai33.pro / ElevenLabs voices) ─────────────────
-  "TTS_PROVIDER",            // voiceover engine: ai33pro (default, ElevenLabs voices) | 69labs (ElevenLabs) | kokoro (ai33.pro Kokoro) | minimax (DIRECT MiniMax official API, own voices) | minimax-ai33pro (MiniMax via ai33.pro).
-  "LABS69_API_KEY",          // 69labs API key (vk_...). Only needed when TTS_PROVIDER = 69labs.
-  "MINIMAX_API_KEY",         // MiniMax direct T2A API key (Bearer). Only needed when TTS_PROVIDER = minimax.
-  "MINIMAX_GROUP_ID",        // MiniMax GroupId — required on some accounts/regions; appended as ?GroupId= when set.
-  "MINIMAX_MODEL",           // MiniMax TTS model, e.g. speech-02-hd.
-  "TTS_VOICE_PROVIDER",      // 69labs path only: elevenlabs (default) | edgetts | voice-clone. We use elevenlabs so the voice matches ai33pro.
-  "TTS_VOICE_ID",            // ElevenLabs voice id (path-segment in ai33pro URL; also used by 69labs-elevenlabs)
+  // ── Text-to-Speech (ai33.pro / ElevenLabs / MiniMax) ──────────────
+  "TTS_PROVIDER",            // ai33pro | 69labs | kokoro | minimax | minimax-ai33pro
+  "LABS69_API_KEY",          // 69labs API key
+  "MINIMAX_API_KEY",         // MiniMax direct T2A API key
+  "MINIMAX_GROUP_ID",        // MiniMax GroupId
+  "MINIMAX_MODEL",           // MiniMax TTS model, e.g. speech-02-hd
+  "TTS_VOICE_PROVIDER",      // 69labs path only: elevenlabs | edgetts | voice-clone
+  "TTS_VOICE_ID",            // narration voice id/name
   "TTS_MODEL",               // ElevenLabs model, e.g. eleven_multilingual_v2
-  "TTS_SPEED",               // 0.5–2.0 playback tempo. <1 = slower/calmer voice (applied via ffmpeg, pitch-preserving)
-  "TTS_MODE",                // single-shot (default) | per-scene. Single-shot synthesizes ONE continuous voiceover for the whole script then aligns scene boundaries via Groq Whisper word-timestamps — fixes mid-sentence pauses at scene boundaries.
-  "MAX_CLIP_SECONDS",        // single-shot: max length of one b-roll clip (seconds). Longer scene ranges are split into equal sub-clips, each with its own Pexels asset. 0 = disabled (one clip per scene).
-  "MIN_SCENE_SECONDS",       // single-shot: minimum seconds a visual stays on screen. Scenes shorter than this are merged with the next (keeping the first scene's footage) so the picture doesn't flip every 1-2s.
-  "MAX_PAUSE_SECONDS",       // single-shot: cap every silence in the continuous voiceover to this many seconds (tames over-long pauses between sentences / at chunk seams). 0 = off.
+  "TTS_SPEED",               // 0.5–2.0 playback tempo
+  "TTS_MODE",                // single-shot | per-scene
+  "MAX_CLIP_SECONDS",        // single-shot max length of one b-roll clip
+  "MIN_SCENE_SECONDS",       // single-shot minimum seconds a visual stays on screen
+  "MAX_PAUSE_SECONDS",       // single-shot max silence cap
+
+  // ── HeyGen host/avatar segments ───────────────────────────────────
+  "HEYGEN_MODE",             // off | host_segments | full_host (reserved)
+  "HEYGEN_API_KEY",          // HeyGen API key. Secret; never commit real values.
+  "HEYGEN_AVATAR_ID",        // HeyGen avatar id
+  "HEYGEN_VOICE_ID",         // HeyGen voice id
+  "HEYGEN_ASPECT_RATIO",     // 16:9 | 9:16 | 1:1
+  "HEYGEN_OUTPUT_FORMAT",    // mp4
+  "HEYGEN_CACHE",            // on | off
 
   // ── Stock footage (multi-source) ──────────────────────────────────
   "FOOTAGE_SOURCES",           // comma list of libraries to query, in order. Default "pexels,pixabay".
-  "FOOTAGE_AI_PICK",           // on (default) | off — let Gemini LOOK AT each candidate thumbnail and pick the best match. Relevance bar is hardcoded (80% → cascades to 70/60/50, then best-available). off = local text-match score only.
-  "GEMINI_VISION_MODEL",       // Gemini model used for vision/preview image scoring. Default: gemini-flash-latest.
+  "FOOTAGE_AI_PICK",           // on | off — Gemini Vision scores candidate thumbnails
+  "GEMINI_VISION_MODEL",       // Gemini model used for vision/preview image scoring
   "PRODUCTION_MODE",           // quality | balanced (default) | batch
   "FOOTAGE_SEARCH_ATTEMPTS",   // default: 3
-  "VISION_CONCURRENCY",         // default: 2
+  "VISION_CONCURRENCY",        // default: 2
   "VISION_CANDIDATE_LIMIT",    // default: 8
   "VISION_COOLDOWN_ON_429_SEC", // default: 120
   "STOCK_FOOTAGE_ORIENTATION", // landscape | portrait | square
-  "STOCK_FOOTAGE_MAX_HEIGHT",  // 720 | 1080 | 2160 — caps file size
-  "STOCK_FOOTAGE_MIN_DURATION", // seconds — skip stingers shorter than this
-  "SCENE_PHOTO_RATIO",         // 0–100, % of scenes that use a still photo (ken-burns) vs a video clip
-  "SCENE_MIX_MODE",            // random | alternating — how photo scenes are distributed
-  "IMAGE_RATIO",             // 16:9 | 9:16 | 1:1 — read by FFmpeg assembly
+  "STOCK_FOOTAGE_MAX_HEIGHT",  // 720 | 1080 | 2160
+  "STOCK_FOOTAGE_MIN_DURATION", // seconds
+  "SCENE_PHOTO_RATIO",         // 0–100
+  "SCENE_MIX_MODE",            // random | alternating
+  "IMAGE_RATIO",               // 16:9 | 9:16 | 1:1
 
   // ── Video assembly (FFmpeg) ───────────────────────────────────────
-  "VIDEO_RESOLUTION",        // e.g. 1920x1080
-  "VIDEO_FPS",               // 24 / 30 / 60
-  "SCENE_DURATION_SECONDS",  // fallback duration when TTS length is unknown
-  "TRANSITION_MIN",          // min crossfade length (s); each cut gets a random fade in [min,max]
-  "TRANSITION_MAX",          // max crossfade length (s); max<=0 → hard cuts (no transitions)
-  "SCENE_TAIL_SILENCE",      // silence appended to each clip's audio (seconds)
+  "VIDEO_RESOLUTION",
+  "VIDEO_FPS",
+  "SCENE_DURATION_SECONDS",
+  "TRANSITION_MIN",
+  "TRANSITION_MAX",
+  "SCENE_TAIL_SILENCE",
 
   // ── On-screen text (hook emphasis) ────────────────────────────────
-  "TEXT_OVERLAY_MODE",       // off | hook (default) | all — pop key numbers/years/places as big text
-  "TEXT_OVERLAY_HOOK_SECONDS", // when mode=hook, only show overlays inside the first N seconds
-  "TEXT_OVERLAY_FONT",       // absolute path to a .ttf/.otf for the overlay; empty = auto-detect a bold system font
-  "CAPTION_LEAD_IN_SEC",     // how early captions may appear (seconds)
-  "CAPTION_TRAIL_SEC",       // how long caption remains after spoken word (seconds)
-  "CAPTION_FONT_SIZE_PERCENT", // font size as percent of video height
-  "CAPTION_POSITION_Y_PERCENT", // vertical position of captions
-  "CAPTION_DETECTION_MODE",  // literal (only explicit) | off (no auto captions)
-
-  "STEP_OVERLAY_TRAIL_SEC",    // how long the step overlay remains after spoken step title finishes
-  "STEP_OVERLAY_ANIMATION",    // slide-up | fade | none
-  "STEP_OVERLAY_ENTER_SEC",    // entrance animation duration
-  "STEP_OVERLAY_EXIT_SEC",     // exit animation duration
-
+  "TEXT_OVERLAY_MODE",
+  "TEXT_OVERLAY_HOOK_SECONDS",
+  "TEXT_OVERLAY_FONT",
+  "CAPTION_LEAD_IN_SEC",
+  "CAPTION_TRAIL_SEC",
+  "CAPTION_FONT_SIZE_PERCENT",
+  "CAPTION_POSITION_Y_PERCENT",
+  "CAPTION_DETECTION_MODE",
+  "STEP_OVERLAY_TRAIL_SEC",
+  "STEP_OVERLAY_ANIMATION",
+  "STEP_OVERLAY_ENTER_SEC",
+  "STEP_OVERLAY_EXIT_SEC",
 
   // ── Performance / Concurrency ─────────────────────────────────────
-  "TTS_CONCURRENCY",         // parallel TTS jobs
-  "ANIMATION_CONCURRENCY",   // parallel Pexels jobs
-  "ASSEMBLE_CONCURRENCY",    // parallel FFmpeg clip renders
+  "TTS_CONCURRENCY",
+  "ANIMATION_CONCURRENCY",
+  "ASSEMBLE_CONCURRENCY",
 
   // ── Reliability ───────────────────────────────────────────────────
-  "FAILURE_THRESHOLD_PERCENT", // 0–100. If more than this % of scenes fail, the run aborts.
+  "FAILURE_THRESHOLD_PERCENT",
 
   // ── Google Drive backup (optional) ────────────────────────────────
-  "GDRIVE_CLIENT_ID",            // OAuth2 client id (Google Cloud Console)
-  "GDRIVE_CLIENT_SECRET",        // OAuth2 client secret (masked in UI)
-  "GDRIVE_REFRESH_TOKEN",        // set by the OAuth callback, not by the user
-  "GDRIVE_CONNECTED_EMAIL",      // set by the OAuth callback — shows who is connected
-  "GDRIVE_FINAL_VIDEOS_FOLDER_ID", // Drive folder id for final.mp4s. Empty = auto-create
-  "GDRIVE_RUNS_FOLDER_ID",       // Drive folder id for per-run source assets. Empty = auto-create
-  "GDRIVE_SYNC_ENABLED",         // "1" = auto-upload finished runs to Drive
+  "GDRIVE_CLIENT_ID",
+  "GDRIVE_CLIENT_SECRET",
+  "GDRIVE_REFRESH_TOKEN",
+  "GDRIVE_CONNECTED_EMAIL",
+  "GDRIVE_FINAL_VIDEOS_FOLDER_ID",
+  "GDRIVE_RUNS_FOLDER_ID",
+  "GDRIVE_SYNC_ENABLED",
 ] as const;
 
 /** Keys whose values are secrets and should be masked when sent to the UI. */
@@ -159,7 +166,7 @@ export function getMaskedSettings(): Record<string, string> {
 }
 
 export const DEFAULTS: Record<SettingKey, string> = {
-  // Required API keys — empty by default, user must provide
+  // Required API keys
   GOOGLE_API_KEY: "",
   PEXELS_API_KEY: "",
   PIXABAY_API_KEY: "",
@@ -168,56 +175,42 @@ export const DEFAULTS: Record<SettingKey, string> = {
 
   FFMPEG_PATH: "",
 
-  // Storage — empty = use default (DATA_DIR/runs)
+  // Storage
   RUNS_OUTPUT_DIR: "",
 
-  // Scene split — Gemini, DeepSeek, OpenAI, etc.
+  // Scene split
   SCENE_SPLIT_PROVIDER: "gemini",
   SCENE_SPLIT_MODEL: "gemini-flash-latest",
   OPENAI_API_KEY: "",
   OPENAI_BASE_URL: "",
-  // Optional channel/setting hint. Empty = the model infers the setting from
-  // the script itself (recommended). When set, it's passed as background DATA
-  // so footage stays on-theme — but never executed as instructions.
   VIDEO_CONTEXT: "",
 
-  // TTS — ai33.pro with ElevenLabs voices. Default voice left empty so the
-  // user picks one in /settings (any ElevenLabs voice id works).
-  // Voiceover engine: ai33pro by default. Switch to 69labs to route the SAME
-  // ElevenLabs voices through the 69labs gateway (needs LABS69_API_KEY).
+  // TTS
   TTS_PROVIDER: "ai33pro",
   LABS69_API_KEY: "",
-  // MiniMax direct API (bypasses ai33.pro). Empty until you switch to minimax.
   MINIMAX_API_KEY: "",
   MINIMAX_GROUP_ID: "",
   MINIMAX_MODEL: "speech-02-hd",
-  // 69labs path only — elevenlabs keeps the voice identical to ai33pro.
   TTS_VOICE_PROVIDER: "elevenlabs",
   TTS_VOICE_ID: "",
   TTS_MODEL: "eleven_multilingual_v2",
   TTS_SPEED: "1.0",
-  // single-shot = one continuous voiceover for the whole script (no mid-sentence
-  // pauses at scene cuts). per-scene = legacy one-TTS-call-per-scene flow.
   TTS_MODE: "single-shot",
-  // Cap a single b-roll clip at 7s; longer scene audio ranges are split into
-  // equal sub-clips so the visuals keep changing. 0 disables the split.
   MAX_CLIP_SECONDS: "7",
-  // Merge scenes shorter than this into the next so footage stays ≥3s on screen
-  // (stops the 1-2s "jumping on every word" look). Pairs with MAX_CLIP_SECONDS=7
-  // → visuals land in a calm ~3–7s range.
   MIN_SCENE_SECONDS: "3",
-  // Cap any silence in the single-shot voiceover to 0.6s. Trims the over-long
-  // gaps (sentence pauses, chunk-seam silence) while leaving natural short
-  // pauses alone. 0 disables it (keep the raw TTS pacing).
   MAX_PAUSE_SECONDS: "0.6",
 
-  // Stock footage (Pexels) — defaults match a typical long-form 16:9 channel.
-  // Query Pexels + Pixabay (both video+photo, no attribution). Add a key for
-  // each you want; a source with no key is silently skipped.
+  // HeyGen host/avatar segments. Empty by default; user fills locally in Settings/.env.
+  HEYGEN_MODE: "off",
+  HEYGEN_API_KEY: "",
+  HEYGEN_AVATAR_ID: "",
+  HEYGEN_VOICE_ID: "",
+  HEYGEN_ASPECT_RATIO: "16:9",
+  HEYGEN_OUTPUT_FORMAT: "mp4",
+  HEYGEN_CACHE: "on",
+
+  // Stock footage
   FOOTAGE_SOURCES: "pexels,pixabay",
-  // Gemini LOOKS AT each candidate's thumbnail and scores how well it fits the
-  // scene + whole-video context; the best ≥80% wins (cascades 80→70→60→50, then
-  // best-available — a scene never fails). off = local text-match score only.
   FOOTAGE_AI_PICK: "on",
   GEMINI_VISION_MODEL: "gemini-flash-latest",
   PRODUCTION_MODE: "balanced",
@@ -228,8 +221,6 @@ export const DEFAULTS: Record<SettingKey, string> = {
   STOCK_FOOTAGE_ORIENTATION: "landscape",
   STOCK_FOOTAGE_MAX_HEIGHT: "1080",
   STOCK_FOOTAGE_MIN_DURATION: "4",
-  // 40% of scenes use a still photo with ken-burns zoom — adds visual variety
-  // and helps when Pexels has a strong photo for a query but weak video.
   SCENE_PHOTO_RATIO: "40",
   SCENE_MIX_MODE: "random",
   IMAGE_RATIO: "16:9",
@@ -242,6 +233,7 @@ export const DEFAULTS: Record<SettingKey, string> = {
   TRANSITION_MAX: "0.7",
   SCENE_TAIL_SILENCE: "0.4",
 
+  // Captions / step overlays
   TEXT_OVERLAY_MODE: "hook",
   TEXT_OVERLAY_HOOK_SECONDS: "30",
   TEXT_OVERLAY_FONT: "",
@@ -250,12 +242,10 @@ export const DEFAULTS: Record<SettingKey, string> = {
   CAPTION_FONT_SIZE_PERCENT: "13",
   CAPTION_POSITION_Y_PERCENT: "72",
   CAPTION_DETECTION_MODE: "literal",
-
   STEP_OVERLAY_TRAIL_SEC: "1.0",
   STEP_OVERLAY_ANIMATION: "slide-up",
   STEP_OVERLAY_ENTER_SEC: "0.35",
   STEP_OVERLAY_EXIT_SEC: "0.25",
-
 
   // Performance
   TTS_CONCURRENCY: "3",
@@ -265,7 +255,7 @@ export const DEFAULTS: Record<SettingKey, string> = {
   // Reliability
   FAILURE_THRESHOLD_PERCENT: "25",
 
-  // Google Drive backup — all empty by default (feature off until configured).
+  // Google Drive backup
   GDRIVE_CLIENT_ID: "",
   GDRIVE_CLIENT_SECRET: "",
   GDRIVE_REFRESH_TOKEN: "",
