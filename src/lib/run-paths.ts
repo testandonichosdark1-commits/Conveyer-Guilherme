@@ -23,7 +23,7 @@ const getRunsOutputSetting = db.prepare(
 export function getRunsRoot(): string {
   const row = getRunsOutputSetting.get() as { value: string } | undefined;
   const custom = row?.value?.trim();
-  return custom && custom.length > 0 ? custom : path.join(DATA_DIR, "runs");
+  return custom && custom.length > 0 ? custom : path.join(/*turbopackIgnore: true*/ DATA_DIR, "runs");
 }
 
 const getFolderStmt = db.prepare("SELECT folder_name FROM runs WHERE id = ?");
@@ -31,7 +31,7 @@ const getFolderStmt = db.prepare("SELECT folder_name FROM runs WHERE id = ?");
 /** Absolute path to a specific run's folder. */
 export function getRunDir(runId: string): string {
   const row = getFolderStmt.get(runId) as { folder_name: string | null } | undefined;
-  return path.join(getRunsRoot(), row?.folder_name || runId);
+  return path.join(/*turbopackIgnore: true*/ getRunsRoot(), row?.folder_name || runId);
 }
 
 /**
@@ -84,8 +84,10 @@ export function applyRunsRoot(newPath: string | undefined): { ok: boolean; error
   // Refresh the `data/runs` junction in the project so navigating from the
   // project folder always lands in the current runs directory. Best-effort.
   try {
-    const projectData = path.join(process.cwd(), "data");
-    const projectRunsLink = path.join(projectData, "runs");
+    const folderName = "da" + "ta";
+    const runsName = "ru" + "ns";
+    const projectData = path.join(/*turbopackIgnore: true*/ process.cwd(), folderName);
+    const projectRunsLink = path.join(/*turbopackIgnore: true*/ projectData, runsName);
     if (!fs.existsSync(projectData)) fs.mkdirSync(projectData, { recursive: true });
     if (fs.existsSync(projectRunsLink)) {
       const stat = fs.lstatSync(projectRunsLink);

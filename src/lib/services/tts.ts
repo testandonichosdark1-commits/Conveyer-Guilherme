@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { getSetting } from "../settings";
 import { log } from "../logger";
 import type { Scene } from "./scene-split";
-import { createTtsTask, pollTask, downloadTask } from "./ai33pro";
+import { createTtsTask, pollTask, downloadTask, createMinimaxAi33proTask } from "./ai33pro";
 import { createV3SpeechTask, pollV3Task, downloadV3Task } from "./ai33pro";
 import { synthesizeMinimax } from "./minimax";
 import { createTtsJob, pollJob, downloadJob } from "./labs69";
@@ -43,16 +43,19 @@ type TtsOptions = Record<string, never>;
  * If both keys are set, TTS_PROVIDER is respected. Exported so the pipeline can
  * show the user which engine is live.
  */
-export function resolveTtsProvider(): "ai33pro" | "69labs" | "kokoro" | "minimax" {
+export function resolveTtsProvider(): "ai33pro" | "69labs" | "kokoro" | "minimax" | "minimax-ai33pro" {
   const selected = (getSetting("TTS_PROVIDER") || "ai33pro").toLowerCase();
   const hasAi33 = getSetting("AI33PRO_API_KEY").trim().length > 0;
   const has69 = getSetting("LABS69_API_KEY").trim().length > 0;
   const hasMinimax = getSetting("MINIMAX_API_KEY").trim().length > 0;
+  if (selected === "minimax-ai33pro") {
+    return hasAi33 || !hasMinimax ? "minimax-ai33pro" : "minimax";
+  }
   if (selected === "minimax") {
     // MiniMax uses its own key. If it's missing, fall back to a configured engine
     // so narration still works; otherwise stay (a clear key error surfaces later).
     if (hasMinimax) return "minimax";
-    if (hasAi33) return "ai33pro";
+    if (hasAi33) return "minimax-ai33pro";
     if (has69) return "69labs";
     return "minimax";
   }
@@ -86,6 +89,8 @@ async function dispatchTts(
     await kokoroTts(runId, text, outPath);
   } else if (provider === "minimax") {
     await minimaxTts(runId, text, outPath);
+  } else if (provider === "minimax-ai33pro") {
+    await minimaxAi33proTts(runId, text, outPath);
   } else {
     await ai33proTts(runId, text, outPath);
   }
@@ -198,33 +203,42 @@ function clamp(n: number, min: number, max: number): number {
 }
 
 /**
- * Kokoro TTS via the ai33.pro V3 unified API. Kokoro is a different, ~50% cheaper
- * model with its OWN voices (kokoro_af_heart, kokoro_am_adam, …) — NOT ElevenLabs
- * ids. It exposes a NATIVE speed (0.5–1.5), so TTS_SPEED is passed in-request and
- * we do NOT run atempo afterwards (doing both would double-slow the voice). Uses
- * the same AI33PRO_API_KEY as the ElevenLabs ai33pro path.
+ * Kokoro TTS via the ai33.pro V1 API (avoiding V3 recaptcha blocks).
+ * Kokoro is a different, cheaper model with its OWN voices (kokoro_af_heart, kokoro_am_adam, …).
+ * Uses the same AI33PRO_API_KEY as the ElevenLabs ai33pro path.
  */
 async function kokoroTts(runId: string, text: string, outPath: string): Promise<void> {
   const voiceId = resolveKokoroVoiceId(getSetting("TTS_VOICE_ID") || "");
-  const speedRaw = parseFloat(getSetting("TTS_SPEED") || "1");
-  const speed = Number.isFinite(speedRaw) ? clamp(speedRaw, 0.5, 1.5) : 1;
 
-  const taskId = await createV3SpeechTask(text, { voiceId, speed, withTranscript: false });
-  log(runId, "debug", `Kokoro TTS task ${taskId.slice(0, 8)}… (${voiceId}, speed=${speed})`, {
+  const taskId = await createTtsTask(text, { voiceId, modelId: "kokoro" });
+  log(runId, "debug", `Kokoro TTS task ${taskId.slice(0, 8)}… (${voiceId})`, {
     stage: "tts",
   });
 
   let task;
   try {
-    task = await pollV3Task(taskId, runId, "tts");
+    task = await pollTask(taskId, runId, "tts");
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     throw new Error(
       `${msg} — check the Kokoro voice "${voiceId}" is valid for this ai33.pro account.`
     );
   }
-  await downloadV3Task(task, outPath);
-  // NOTE: no applyAudioTempo here — speed is native (passed in the request above).
+  await downloadTask(task, outPath);
+
+  // Apply the voice-speed setting (pitch-preserving) via ffmpeg atempo
+  const speed = parseFloat(getSetting("TTS_SPEED") || "1");
+  if (Number.isFinite(speed) && Math.abs(speed - 1) > 0.01) {
+    try {
+      await applyAudioTempo(outPath, speed);
+      log(runId, "debug", `Voice speed ${speed}× applied (Kokoro V1 / atempo)`, { stage: "tts" });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      log(runId, "warn", `Voice-speed adjust failed (using original): ${msg.slice(0, 150)}`, {
+        stage: "tts",
+      });
+    }
+  }
 }
 
 /**
@@ -257,6 +271,45 @@ async function minimaxTts(runId: string, text: string, outPath: string): Promise
   log(runId, "debug", `MiniMax TTS (${model} / ${voiceId}, speed=${speed})`, { stage: "tts" });
   await synthesizeMinimax(text, outPath, { voiceId, model, speed });
   // NOTE: no applyAudioTempo — speed is native (voice_setting.speed above).
+}
+
+/**
+ * MiniMax TTS via the ai33.pro V1m proxy API. Uses the same AI33PRO_API_KEY (xi-api-key)
+ * as the ElevenLabs ai33pro path. MiniMax has its OWN voices (e.g.
+ * "English_Graceful_Lady") — NOT ElevenLabs ids — and a NATIVE speed (0.5–2.0).
+ */
+async function minimaxAi33proTts(runId: string, text: string, outPath: string): Promise<void> {
+  const voiceId = resolveMinimaxAi33proVoiceId(getSetting("TTS_VOICE_ID") || "");
+  const model = getSetting("MINIMAX_MODEL") || "speech-02-hd";
+  const speedRaw = parseFloat(getSetting("TTS_SPEED") || "1");
+  const speed = Number.isFinite(speedRaw) ? clamp(speedRaw, 0.5, 2) : 1;
+
+  const taskId = await createMinimaxAi33proTask(text, { voiceId, model, speed });
+  log(runId, "debug", `MiniMax (ai33pro) TTS task ${taskId.slice(0, 8)}… (${model} / ${voiceId}, speed=${speed})`, {
+    stage: "tts",
+  });
+
+  let task;
+  try {
+    task = await pollTask(taskId, runId, "tts");
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(
+      `${msg} — check the MiniMax voice "${voiceId}" is valid for this ai33.pro account.`
+    );
+  }
+  await downloadTask(task, outPath);
+  // NOTE: no applyAudioTempo here — speed is native (passed in the request above).
+}
+
+/**
+ * Normalizes a MiniMax voice id to the bare form. Strip any provider prefixes.
+ * Empty input → a sensible default so it works out of the box.
+ */
+function resolveMinimaxAi33proVoiceId(raw: string): string {
+  let v = raw.trim();
+  if (!v) return "English_Graceful_Lady";
+  return v.replace(/^(elevenlabs_|minimax_|kokoro_|clone_|edge_)/i, "");
 }
 
 /**

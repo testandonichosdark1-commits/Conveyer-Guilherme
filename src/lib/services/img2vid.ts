@@ -22,6 +22,8 @@ export interface AnimateResult {
   path: string;
   /** Whether the path is a moving clip or a still image. */
   kind: AssetMode;
+  /** Unique identifier of the stock asset. */
+  dedupeId?: string;
 }
 
 export interface AnimateOptions {
@@ -29,6 +31,8 @@ export interface AnimateOptions {
   videoUsedIds?: Set<string>;
   /** Mutable set of PHOTO asset ids ("source:id") already used in this run. */
   photoUsedIds?: Set<string>;
+  /** Set of asset ids to avoid for adjacent duplicates. */
+  avoidDedupeIds?: Set<string>;
   /** Which kind of asset to fetch for this scene. Default "video". */
   mode?: AssetMode;
   /**
@@ -41,6 +45,7 @@ export interface AnimateOptions {
   /** One-line summary of the WHOLE video, passed to the vision relevance scorer
    *  so footage is judged against the overall context, not just this moment. */
   videoContext?: string;
+  anchorWords?: string[];
 }
 
 export async function animateScene(
@@ -61,14 +66,15 @@ export async function animateScene(
     data: { mode, prompt: scene.visual_prompt.slice(0, 120) },
   });
 
+  let assetInfo;
   if (mode === "photo") {
-    await pexelsPhoto(runId, scene, filePath, options.photoUsedIds, options.videoContext);
+    assetInfo = await pexelsPhoto(runId, scene, filePath, options.photoUsedIds, options.avoidDedupeIds, options.videoContext, options.anchorWords);
   } else {
-    await pexelsClip(runId, scene, filePath, options.videoUsedIds, options.videoContext);
+    assetInfo = await pexelsClip(runId, scene, filePath, options.videoUsedIds, options.avoidDedupeIds, options.videoContext, options.anchorWords);
   }
 
   log(runId, "success", `Asset ready: ${fileName}`, { stage: "animate" });
-  return { path: filePath, kind: mode };
+  return { path: filePath, kind: mode, dedupeId: assetInfo?.dedupeId };
 }
 
 // ── Pexels video pipeline ───────────────────────────────────────────────────
@@ -78,8 +84,10 @@ async function pexelsClip(
   scene: Scene,
   outPath: string,
   usedIds?: Set<string>,
-  videoContext?: string
-): Promise<void> {
+  avoidDedupeIds?: Set<string>,
+  videoContext?: string,
+  anchorWords?: string[]
+): Promise<{ author: string | null; sourceUrl: string; source: string; dedupeId?: string }> {
   const orientation = (getSetting("STOCK_FOOTAGE_ORIENTATION") || "landscape") as Orientation;
   const maxHeight = Math.max(360, Number(getSetting("STOCK_FOOTAGE_MAX_HEIGHT") || "1080"));
   const minDuration = Math.max(0, Number(getSetting("STOCK_FOOTAGE_MIN_DURATION") || "4"));
@@ -88,15 +96,16 @@ async function pexelsClip(
   let lastErr: unknown;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
-      await acquireStockClipForScene(scene, outPath, {
+      return await acquireStockClipForScene(scene, outPath, {
         runId,
         orientation,
         maxHeight,
         minDuration,
         usedIds,
+        avoidDedupeIds,
         videoContext,
+        anchorWords,
       });
-      return;
     } catch (e) {
       lastErr = e;
       const msg = e instanceof Error ? e.message : String(e);
@@ -120,8 +129,10 @@ async function pexelsPhoto(
   scene: Scene,
   outPath: string,
   usedIds?: Set<string>,
-  videoContext?: string
-): Promise<void> {
+  avoidDedupeIds?: Set<string>,
+  videoContext?: string,
+  anchorWords?: string[]
+): Promise<{ author: string | null; sourceUrl: string; source: string; dedupeId?: string }> {
   const orientation = (getSetting("STOCK_FOOTAGE_ORIENTATION") || "landscape") as Orientation;
   const maxHeight = Math.max(360, Number(getSetting("STOCK_FOOTAGE_MAX_HEIGHT") || "1080"));
 
@@ -129,14 +140,15 @@ async function pexelsPhoto(
   let lastErr: unknown;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
-      await acquireStockPhotoForScene(scene, outPath, {
+      return await acquireStockPhotoForScene(scene, outPath, {
         runId,
         orientation,
         maxHeight,
         usedIds,
+        avoidDedupeIds,
         videoContext,
+        anchorWords,
       });
-      return;
     } catch (e) {
       lastErr = e;
       const msg = e instanceof Error ? e.message : String(e);

@@ -10,7 +10,7 @@ import os from "node:os";
  *
  * Override via CONVEYER_GUILHERME_DATA_DIR environment variable.
  */
-const DATA_DIR =
+export const DATA_DIR =
   process.env.CONVEYER_GUILHERME_DATA_DIR ??
   path.join(os.homedir(), ".conveyer-guilherme");
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -56,6 +56,26 @@ db.exec(`
     data_json TEXT
   );
   CREATE INDEX IF NOT EXISTS idx_run_logs_run ON run_logs(run_id, id);
+
+  CREATE TABLE IF NOT EXISTS search_cache (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS download_cache (
+    dedupe_id TEXT PRIMARY KEY,
+    source_url TEXT,
+    cached_filename TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_download_cache_url ON download_cache(source_url);
+
+  CREATE TABLE IF NOT EXISTS vision_cache (
+    key TEXT PRIMARY KEY,
+    score REAL NOT NULL,
+    created_at INTEGER NOT NULL
+  );
 `);
 
 // Migrations for older DBs. SQLite has no `ALTER TABLE ... ADD COLUMN IF NOT

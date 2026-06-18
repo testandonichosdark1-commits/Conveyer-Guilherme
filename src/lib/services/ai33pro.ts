@@ -18,7 +18,7 @@ import { log, type LogLevel } from "../logger";
 
 const BASE = "https://api.ai33.pro/v1";
 const POLL_INTERVAL_MS = 2500;
-const POLL_MAX_MS = 5 * 60 * 1000;
+const POLL_MAX_MS = 15 * 60 * 1000;
 
 // Single fetch timeout. Bumped from 60s after observing legit ai33pro responses
 // taking 30-90s under load (especially on POST). 120s gives reasonable headroom.
@@ -383,4 +383,70 @@ export async function downloadV3Task(task: V3TaskInfo, outPath: string): Promise
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// V1 Minimax proxy API (using xi-api-key)
+// ════════════════════════════════════════════════════════════════════════════
+
+const V1M_BASE = "https://api.ai33.pro/v1m";
+
+export interface CreateMinimaxAi33proOptions {
+  voiceId: string;
+  model?: string;
+  speed?: number;
+}
+
+export async function createMinimaxAi33proTask(text: string, opts: CreateMinimaxAi33proOptions): Promise<string> {
+  if (!opts.voiceId) throw new Error("ai33pro createMinimaxAi33proTask: voiceId is required");
+
+  const url = `${V1M_BASE}/task/text-to-speech`;
+
+  const body = JSON.stringify({
+    text,
+    model: opts.model || "speech-02-hd",
+    voice_setting: {
+      voice_id: opts.voiceId,
+      vol: 1,
+      pitch: 0,
+      speed: opts.speed ?? 1,
+    },
+    language_boost: "Auto",
+    with_transcript: false,
+  });
+
+  const MAX_ATTEMPTS = 2;
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const resp = await fetchWithTimeout(url, {
+        method: "POST",
+        headers: authHeaders(),
+        body,
+      });
+      if (!resp.ok) {
+        const txt = (await resp.text()).slice(0, 400);
+        if (resp.status < 500) {
+          throw new Error(`ai33pro POST /v1m/task/text-to-speech HTTP ${resp.status}: ${txt}`);
+        }
+        lastErr = new Error(`ai33pro POST /v1m/task/text-to-speech HTTP ${resp.status}: ${txt}`);
+      } else {
+        const json = (await resp.json()) as {
+          success?: boolean;
+          task_id?: string;
+          error?: string;
+          message?: string;
+        };
+        if (json.success === false || !json.task_id) {
+          const msg = json.error || json.message || JSON.stringify(json).slice(0, 200);
+          throw new Error(`ai33pro Minimax task create failed: ${msg}`);
+        }
+        return json.task_id;
+      }
+    } catch (e) {
+      lastErr = e;
+    }
+    if (attempt < MAX_ATTEMPTS) await sleep(2000);
+  }
+  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
 }

@@ -17,12 +17,15 @@ export const SETTING_KEYS = [
   // ── Storage ───────────────────────────────────────────────────────
   "RUNS_OUTPUT_DIR",         // where run folders are written. Empty = default
 
-  // ── Scene splitting (Gemini only) ─────────────────────────────────
-  "SCENE_SPLIT_MODEL",       // e.g. gemini-flash-latest
+  // ── Scene splitting (Gemini / OpenAI / DeepSeek) ──────────────────
+  "SCENE_SPLIT_PROVIDER",    // gemini (default) | openai
+  "SCENE_SPLIT_MODEL",       // e.g. gemini-flash-latest, deepseek-chat, gpt-4o-mini
+  "OPENAI_API_KEY",          // custom API key (for DeepSeek, OpenAI, OpenRouter, etc.)
+  "OPENAI_BASE_URL",         // custom base URL (e.g. https://api.deepseek.com/v1)
   "VIDEO_CONTEXT",           // optional 1–2 sentence channel/setting hint, injected into scene-split as background DATA (never as commands). Capped ~300 chars. Empty = setting inferred automatically from the script.
 
   // ── Text-to-Speech (ai33.pro / ElevenLabs voices) ─────────────────
-  "TTS_PROVIDER",            // voiceover engine: ai33pro (default, ElevenLabs voices) | 69labs (ElevenLabs) | kokoro (ai33.pro Kokoro) | minimax (DIRECT MiniMax official API, own voices).
+  "TTS_PROVIDER",            // voiceover engine: ai33pro (default, ElevenLabs voices) | 69labs (ElevenLabs) | kokoro (ai33.pro Kokoro) | minimax (DIRECT MiniMax official API, own voices) | minimax-ai33pro (MiniMax via ai33.pro).
   "LABS69_API_KEY",          // 69labs API key (vk_...). Only needed when TTS_PROVIDER = 69labs.
   "MINIMAX_API_KEY",         // MiniMax direct T2A API key (Bearer). Only needed when TTS_PROVIDER = minimax.
   "MINIMAX_GROUP_ID",        // MiniMax GroupId — required on some accounts/regions; appended as ?GroupId= when set.
@@ -37,9 +40,14 @@ export const SETTING_KEYS = [
   "MAX_PAUSE_SECONDS",       // single-shot: cap every silence in the continuous voiceover to this many seconds (tames over-long pauses between sentences / at chunk seams). 0 = off.
 
   // ── Stock footage (multi-source) ──────────────────────────────────
-  "FOOTAGE_SOURCES",           // comma list of libraries: pexels,pixabay (video+photo) · openverse,wikimedia (CC images) · archive (CC video, opt-in). Default "pexels,pixabay,openverse,wikimedia".
-  "OPENVERSE_TOKEN",           // optional Openverse bearer token (raises rate limits). Empty works (anonymous).
+  "FOOTAGE_SOURCES",           // comma list of libraries to query, in order. Default "pexels,pixabay".
   "FOOTAGE_AI_PICK",           // on (default) | off — let Gemini LOOK AT each candidate thumbnail and pick the best match. Relevance bar is hardcoded (80% → cascades to 70/60/50, then best-available). off = local text-match score only.
+  "GEMINI_VISION_MODEL",       // Gemini model used for vision/preview image scoring. Default: gemini-flash-latest.
+  "PRODUCTION_MODE",           // quality | balanced (default) | batch
+  "FOOTAGE_SEARCH_ATTEMPTS",   // default: 3
+  "VISION_CONCURRENCY",         // default: 2
+  "VISION_CANDIDATE_LIMIT",    // default: 8
+  "VISION_COOLDOWN_ON_429_SEC", // default: 120
   "STOCK_FOOTAGE_ORIENTATION", // landscape | portrait | square
   "STOCK_FOOTAGE_MAX_HEIGHT",  // 720 | 1080 | 2160 — caps file size
   "STOCK_FOOTAGE_MIN_DURATION", // seconds — skip stingers shorter than this
@@ -59,6 +67,17 @@ export const SETTING_KEYS = [
   "TEXT_OVERLAY_MODE",       // off | hook (default) | all — pop key numbers/years/places as big text
   "TEXT_OVERLAY_HOOK_SECONDS", // when mode=hook, only show overlays inside the first N seconds
   "TEXT_OVERLAY_FONT",       // absolute path to a .ttf/.otf for the overlay; empty = auto-detect a bold system font
+  "CAPTION_LEAD_IN_SEC",     // how early captions may appear (seconds)
+  "CAPTION_TRAIL_SEC",       // how long caption remains after spoken word (seconds)
+  "CAPTION_FONT_SIZE_PERCENT", // font size as percent of video height
+  "CAPTION_POSITION_Y_PERCENT", // vertical position of captions
+  "CAPTION_DETECTION_MODE",  // literal (only explicit) | off (no auto captions)
+
+  "STEP_OVERLAY_TRAIL_SEC",    // how long the step overlay remains after spoken step title finishes
+  "STEP_OVERLAY_ANIMATION",    // slide-up | fade | none
+  "STEP_OVERLAY_ENTER_SEC",    // entrance animation duration
+  "STEP_OVERLAY_EXIT_SEC",     // exit animation duration
+
 
   // ── Performance / Concurrency ─────────────────────────────────────
   "TTS_CONCURRENCY",         // parallel TTS jobs
@@ -93,8 +112,26 @@ const upsertStmt = db.prepare(
 
 export function getSetting(key: SettingKey): string {
   const row = getStmt.get(key) as { value: string } | undefined;
-  if (row && row.value !== "") return row.value;
-  return process.env[key] ?? "";
+  let val = (row && row.value !== "") ? row.value : (process.env[key] ?? "");
+
+  const mode = getProductionMode();
+  if (mode === "batch") {
+    if (key === "ANIMATION_CONCURRENCY" && (val === "" || val === "5")) return "2";
+    if (key === "MAX_CLIP_SECONDS" && (val === "" || val === "7")) return "12";
+    if (key === "SCENE_PHOTO_RATIO" && (val === "" || val === "40")) return "50";
+    if (key === "FOOTAGE_SEARCH_ATTEMPTS" && (val === "" || val === "3")) return "2";
+    if (key === "VISION_CONCURRENCY" && (val === "" || val === "2")) return "1";
+    if (key === "VISION_CANDIDATE_LIMIT" && (val === "" || val === "8")) return "6";
+    if (key === "VISION_COOLDOWN_ON_429_SEC" && (val === "" || val === "120")) return "120";
+  }
+
+  return val;
+}
+
+function getProductionMode(): string {
+  const row = getStmt.get("PRODUCTION_MODE") as { value: string } | undefined;
+  let val = (row && row.value !== "") ? row.value : (process.env["PRODUCTION_MODE"] ?? "");
+  return val.trim().toLowerCase() || "balanced";
 }
 
 export function setSetting(key: SettingKey, value: string) {
@@ -134,8 +171,11 @@ export const DEFAULTS: Record<SettingKey, string> = {
   // Storage — empty = use default (DATA_DIR/runs)
   RUNS_OUTPUT_DIR: "",
 
-  // Scene split — Gemini only
+  // Scene split — Gemini, DeepSeek, OpenAI, etc.
+  SCENE_SPLIT_PROVIDER: "gemini",
   SCENE_SPLIT_MODEL: "gemini-flash-latest",
+  OPENAI_API_KEY: "",
+  OPENAI_BASE_URL: "",
   // Optional channel/setting hint. Empty = the model infers the setting from
   // the script itself (recommended). When set, it's passed as background DATA
   // so footage stays on-theme — but never executed as instructions.
@@ -172,15 +212,19 @@ export const DEFAULTS: Record<SettingKey, string> = {
   MAX_PAUSE_SECONDS: "0.6",
 
   // Stock footage (Pexels) — defaults match a typical long-form 16:9 channel.
-  // Query Pexels + Pixabay (video+photo, no attribution) AND Openverse +
-  // Wikimedia (CC images — attribution required, printed in the run log). Add
-  // "archive" for Internet-Archive CC video. A source with no key is skipped.
-  FOOTAGE_SOURCES: "pexels,pixabay,openverse,wikimedia",
-  OPENVERSE_TOKEN: "",
+  // Query Pexels + Pixabay (both video+photo, no attribution). Add a key for
+  // each you want; a source with no key is silently skipped.
+  FOOTAGE_SOURCES: "pexels,pixabay",
   // Gemini LOOKS AT each candidate's thumbnail and scores how well it fits the
   // scene + whole-video context; the best ≥80% wins (cascades 80→70→60→50, then
   // best-available — a scene never fails). off = local text-match score only.
   FOOTAGE_AI_PICK: "on",
+  GEMINI_VISION_MODEL: "gemini-flash-latest",
+  PRODUCTION_MODE: "balanced",
+  FOOTAGE_SEARCH_ATTEMPTS: "3",
+  VISION_CONCURRENCY: "2",
+  VISION_CANDIDATE_LIMIT: "8",
+  VISION_COOLDOWN_ON_429_SEC: "120",
   STOCK_FOOTAGE_ORIENTATION: "landscape",
   STOCK_FOOTAGE_MAX_HEIGHT: "1080",
   STOCK_FOOTAGE_MIN_DURATION: "4",
@@ -198,12 +242,20 @@ export const DEFAULTS: Record<SettingKey, string> = {
   TRANSITION_MAX: "0.7",
   SCENE_TAIL_SILENCE: "0.4",
 
-  // On-screen text emphasis. "hook" = pop key numbers/years/places as big text
-  // only in the opening seconds (where it lifts retention without getting noisy).
-  // "all" = whole video, "off" = never. Font auto-detected unless overridden.
   TEXT_OVERLAY_MODE: "hook",
   TEXT_OVERLAY_HOOK_SECONDS: "30",
   TEXT_OVERLAY_FONT: "",
+  CAPTION_LEAD_IN_SEC: "0",
+  CAPTION_TRAIL_SEC: "0.35",
+  CAPTION_FONT_SIZE_PERCENT: "13",
+  CAPTION_POSITION_Y_PERCENT: "72",
+  CAPTION_DETECTION_MODE: "literal",
+
+  STEP_OVERLAY_TRAIL_SEC: "1.0",
+  STEP_OVERLAY_ANIMATION: "slide-up",
+  STEP_OVERLAY_ENTER_SEC: "0.35",
+  STEP_OVERLAY_EXIT_SEC: "0.25",
+
 
   // Performance
   TTS_CONCURRENCY: "3",

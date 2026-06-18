@@ -1,4 +1,7 @@
 import fs from "node:fs";
+import path from "node:path";
+import db, { DATA_DIR } from "../db";
+import { pLimit } from "../plimit";
 import { getSetting } from "../settings";
 import { log } from "../logger";
 import { checkCancelled } from "../cancellation";
@@ -108,6 +111,151 @@ interface PexelsPhotoSearchResponse {
 // rotates to the next. When all keys are exhausted at once, it waits on the
 // one whose window refreshes earliest, then resumes there.
 
+// ── Stats and Cooldown States ───────────────────────────────────────────────
+
+export interface RunStats {
+  pexelsCalls: number;
+  pixabayCalls: number;
+  geminiVisionCalls: number;
+  cacheHits: number;
+  cacheMisses: number;
+  pexels429s: number;
+  pixabay429s: number;
+  geminiVision429s: number;
+  assetsReusedFromCache: number;
+}
+
+export const runStatsMap = new Map<string, RunStats>();
+
+export function getOrCreateStats(runId: string): RunStats {
+  let stats = runStatsMap.get(runId);
+  if (!stats) {
+    stats = {
+      pexelsCalls: 0,
+      pixabayCalls: 0,
+      geminiVisionCalls: 0,
+      cacheHits: 0,
+      cacheMisses: 0,
+      pexels429s: 0,
+      pixabay429s: 0,
+      geminiVision429s: 0,
+      assetsReusedFromCache: 0,
+    };
+    runStatsMap.set(runId, stats);
+  }
+  return stats;
+}
+
+let visionCooldownUntil = 0;
+let pixabayCooldownUntil = 0;
+let lastAllPexelsKeysLimitedLogTime = 0;
+
+export function isVisionCooldown(): boolean {
+  return Date.now() < visionCooldownUntil;
+}
+
+export function setVisionCooldown() {
+  const durationSec = Math.max(10, Number(getSetting("VISION_COOLDOWN_ON_429_SEC") || "120"));
+  visionCooldownUntil = Date.now() + durationSec * 1000;
+}
+
+export function isPixabaySuspended(): boolean {
+  return Date.now() < pixabayCooldownUntil;
+}
+
+export function setPixabayCooldown() {
+  pixabayCooldownUntil = Date.now() + 120000;
+}
+
+// ── Cache Prepared Statements ────────────────────────────────────────────────
+
+const getSearchCacheStmt = db.prepare("SELECT value, created_at FROM search_cache WHERE key = ?");
+const insertSearchCacheStmt = db.prepare("INSERT OR REPLACE INTO search_cache (key, value, created_at) VALUES (?, ?, ?)");
+
+const getDownloadCacheStmt = db.prepare("SELECT cached_filename FROM download_cache WHERE dedupe_id = ? OR source_url = ?");
+const insertDownloadCacheStmt = db.prepare("INSERT OR REPLACE INTO download_cache (dedupe_id, source_url, cached_filename, created_at) VALUES (?, ?, ?, ?)");
+
+const getVisionCacheStmt = db.prepare("SELECT score, created_at FROM vision_cache WHERE key = ?");
+const insertVisionCacheStmt = db.prepare("INSERT OR REPLACE INTO vision_cache (key, score, created_at) VALUES (?, ?, ?)");
+
+// ── Cache Helper Functions ───────────────────────────────────────────────────
+
+function getShortHash(str: string): string {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    const char = str.charCodeAt(i);
+    hash = (hash << 5) - hash + char;
+    hash |= 0;
+  }
+  return Math.abs(hash).toString(36);
+}
+
+function deserializeHit(sh: any, runId: string): FootageHit {
+  return {
+    source: sh.source,
+    dedupeId: sh.dedupeId,
+    desc: sh.desc,
+    thumbUrl: sh.thumbUrl,
+    author: sh.author,
+    sourceUrl: sh.sourceUrl,
+    meta: sh.meta,
+    pexelsVideoFile: sh.pexelsVideoFile,
+    pexelsPhotoUrl: sh.pexelsPhotoUrl,
+    downloadUrl: sh.downloadUrl,
+    download: async (out: string) => {
+      if (sh.source === "pexels") {
+        if (sh.pexelsVideoFile) {
+          return downloadPexelsVideo(sh.pexelsVideoFile, out);
+        } else if (sh.pexelsPhotoUrl) {
+          return downloadPexelsPhoto(sh.pexelsPhotoUrl, out);
+        }
+      } else if (sh.source === "pixabay") {
+        if (sh.downloadUrl) {
+          return downloadUrlToFile(sh.downloadUrl, out, runId);
+        }
+      }
+      throw new Error(`Cannot download cached hit ${sh.dedupeId}: missing download payload`);
+    }
+  };
+}
+
+async function downloadWithCache(hit: FootageHit, outPath: string, runId: string): Promise<void> {
+  const cacheKey = hit.dedupeId;
+  const sourceUrl = hit.sourceUrl;
+
+  const downloadCacheDir = path.join(DATA_DIR, "download_cache");
+  if (!fs.existsSync(downloadCacheDir)) {
+    fs.mkdirSync(downloadCacheDir, { recursive: true });
+  }
+
+  try {
+    const cached = getDownloadCacheStmt.get(cacheKey, sourceUrl) as { cached_filename: string } | undefined;
+    if (cached) {
+      const cachedFilePath = path.join(downloadCacheDir, cached.cached_filename);
+      if (fs.existsSync(cachedFilePath)) {
+        fs.copyFileSync(cachedFilePath, outPath);
+        getOrCreateStats(runId).assetsReusedFromCache++;
+        log(runId, "info", `Asset reused from cache: ${cacheKey}`, { stage: "animate" });
+        return;
+      }
+    }
+  } catch (e) {
+    // ignore
+  }
+
+  await hit.download(outPath);
+
+  try {
+    const ext = path.extname(outPath) || (hit.meta.includes("photo") || hit.pexelsPhotoUrl ? ".jpg" : ".mp4");
+    const safeFilename = `${hit.dedupeId.replace(/:/g, "_")}${ext}`;
+    const cachedFilePath = path.join(downloadCacheDir, safeFilename);
+    fs.copyFileSync(outPath, cachedFilePath);
+    insertDownloadCacheStmt.run(cacheKey, sourceUrl, safeFilename, Date.now());
+  } catch (e) {
+    // ignore
+  }
+}
+
 interface KeyState {
   key: string;
   remaining: number | null;
@@ -119,6 +267,13 @@ const keyPool: { keys: KeyState[]; cursor: number } = {
   keys: [],
   cursor: 0,
 };
+
+export function isPexelsSuspended(): boolean {
+  const keys = keyPool.keys;
+  if (keys.length === 0) return false;
+  const now = Date.now();
+  return keys.every(k => k.exhaustedUntilMs !== null && k.exhaustedUntilMs > now);
+}
 
 /** Re-parse PEXELS_API_KEY each call; preserve state for keys we've seen before. */
 function refreshKeyPool(): KeyState[] {
@@ -256,10 +411,14 @@ async function pexelsFetch(url: URL | string, runId: string | undefined): Promis
   let hits429 = 0;
   while (hits429 < MAX_429_HITS) {
     const state = await acquireKey(runId);
+    if (runId) {
+      getOrCreateStats(runId).pexelsCalls++;
+    }
     const resp = await fetch(url, { headers: { Authorization: state.key } });
 
     if (resp.status === 429) {
       hits429++;
+      getOrCreateStats(runId || "").pexels429s++;
       try {
         await resp.text();
       } catch {}
@@ -493,27 +652,142 @@ function pexelsSlugTokens(pageUrl: string): string[] {
   }
 }
 
+export function stemWord(w: string): string {
+  w = w.toLowerCase().trim();
+  // Strip common suffixes in order of specificity
+  if (w.endsWith("ies")) w = w.slice(0, -3) + "y";
+  else if (w.endsWith("ing")) w = w.slice(0, -3);
+  else if (w.endsWith("ed")) w = w.slice(0, -2);
+  else if (w.endsWith("er")) w = w.slice(0, -2);
+  else if (w.endsWith("es")) w = w.slice(0, -2);
+  else if (w.endsWith("ion")) w = w.slice(0, -3);
+  else if (w.endsWith("e")) w = w.slice(0, -1);
+  else if (w.endsWith("s") && !w.endsWith("ss")) w = w.slice(0, -1);
+
+  // Strip double consonants at the end (e.g. running -> runn -> run, shopping -> shopp -> shop)
+  if (w.length >= 4 && w[w.length - 1] === w[w.length - 2]) {
+    const last = w[w.length - 1];
+    if (["b", "d", "g", "l", "m", "n", "p", "r", "t"].includes(last)) {
+      w = w.slice(0, -1);
+    }
+  }
+  return w;
+}
+
+const ANCHOR_STOPWORDS = new Set([
+  // Basic stopwords
+  "a", "an", "the", "of", "in", "on", "at", "and", "or", "with", "to", "for",
+  "by", "from", "is", "are", "this", "that", "over", "under", "into", "near",
+  "his", "her", "its", "their", "video", "photo", "footage", "stock", "free",
+  
+  // Pronouns
+  "you", "your", "yours", "he", "him", "she", "they", "them", "their", "theirs",
+  "we", "us", "our", "ours", "i", "me", "my", "mine", "it", "who", "whom", "whose",
+  "these", "those", "what", "which", "someone", "something", "anyone", "anything",
+  
+  // Common generic verbs & helpers
+  "let", "make", "makes", "making", "put", "puts", "putting", "get", "gets", "getting",
+  "take", "takes", "taking", "go", "goes", "going", "come", "comes", "coming",
+  "see", "sees", "seeing", "look", "looks", "looking", "want", "wants", "wanting",
+  "need", "needs", "needing", "use", "uses", "using", "do", "does", "did", "done", "doing",
+  "have", "has", "had", "having", "keep", "keeps", "keeping", "give", "gives", "giving",
+  "tell", "tells", "telling", "say", "says", "saying", "think", "thinks", "thinking",
+  "know", "knows", "knowing", "find", "finds", "finding", "work", "works", "working",
+  
+  // Generic action & visual keywords that should not be anchors
+  "reach", "reaching", "grab", "grabbing", "open", "opening", "close", "closing", "hold", "holding",
+  "container", "contain", "box", "bag", "pack", "package", "packaging", "shelf", "shelves",
+  "display", "table", "store", "shop", "shopper", "supermarket", "kitchen", "home",
+  "clamshell",
+  
+  // Filler/adverbs
+  "like", "just", "even", "also", "very", "too", "really", "back", "here", "there",
+  "when", "where", "why", "how", "all", "any", "both", "each", "few", "more", "most",
+  "other", "some", "such", "than", "then", "once", "now", "well", "dont"
+]);
+
+export function extractAnchorWords(scriptText: string): string[] {
+  const tokens = scriptText
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .split(/\s+/)
+    .filter((w) => w.length >= 3 && !ANCHOR_STOPWORDS.has(w))
+    .map(stemWord);
+
+  const freqs = new Map<string, number>();
+  for (const t of tokens) {
+    freqs.set(t, (freqs.get(t) ?? 0) + 1);
+  }
+
+  // If the script is very short (under 100 words), let's allow frequency >= 1
+  const minFreq = scriptText.split(/\s+/).length < 100 ? 1 : 2;
+
+  const sorted = [...freqs.entries()]
+    .filter(([_, count]) => count >= minFreq)
+    .sort((a, b) => b[1] - a[1])
+    .map(([word]) => word)
+    .slice(0, 12);
+
+  return sorted;
+}
+
 /** Loose word match so "shopping" pairs with "shop", "waves" with "wave":
- *  exact, or one is a ≥4-char prefix of the other. */
+ *  exact, or one is a ≥3-char prefix of the other with bounded length difference. */
 function tokensMatch(a: string, b: string): boolean {
-  if (a === b) return true;
-  if (Math.min(a.length, b.length) < 4) return false;
-  return a.startsWith(b) || b.startsWith(a);
+  const sa = stemWord(a);
+  const sb = stemWord(b);
+  if (sa === sb) return true;
+  if (Math.min(sa.length, sb.length) < 3) return false;
+  if (sa.startsWith(sb) || sb.startsWith(sa)) {
+    // Only match if the length difference between stems is small (avoid strawberries matching straw)
+    return Math.abs(sa.length - sb.length) <= 3;
+  }
+  return false;
 }
 
 /**
  * 0..1: how much of ONE of the scene's queries this candidate's description
  * covers (the best-matching query wins). 1 = every meaningful word of a query
  * is present; 0 = shares nothing with any query, or has no description at all.
+ * Optionally penalizes candidates that miss script-level anchor words present in the query.
  */
-function relevanceScore(candTokens: string[], queryTokenLists: string[][]): number {
+function relevanceScore(
+  candTokens: string[],
+  queryTokenLists: string[][],
+  anchorWords?: string[]
+): number {
   if (candTokens.length === 0) return 0;
   let best = 0;
   for (const q of queryTokenLists) {
     if (q.length === 0) continue;
     let hit = 0;
     for (const t of q) if (candTokens.some((c) => tokensMatch(c, t))) hit++;
-    if (hit / q.length > best) best = hit / q.length;
+    let score = hit / q.length;
+
+    // Apply anchor words penalty if anchorWords are provided
+    if (anchorWords && anchorWords.length > 0) {
+      // Find which query tokens match any anchor word (with flexible endsWith/startsWith matches)
+      const queryAnchors = q.filter((qt) => {
+        const sqt = stemWord(qt);
+        return anchorWords.some((aw) => {
+          const saw = stemWord(aw);
+          return saw === sqt || saw.endsWith(sqt) || sqt.endsWith(saw);
+        });
+      });
+
+      if (queryAnchors.length > 0) {
+        // Check if the candidate matches at least one of these query anchors
+        const matchesAnyAnchor = queryAnchors.some((qa) =>
+          candTokens.some((ct) => tokensMatch(ct, qa))
+        );
+        if (!matchesAnyAnchor) {
+          // Penalize the score significantly (multiply by 0.35)
+          score *= 0.35;
+        }
+      }
+    }
+
+    if (score > best) best = score;
   }
   return best;
 }
@@ -538,24 +812,42 @@ interface FootageHit {
   sourceUrl: string;
   meta: string;         // short label for logs, e.g. "1920x1080 12s"
   download: (outPath: string) => Promise<void>;
+  pexelsVideoFile?: any;
+  pexelsPhotoUrl?: string;
+  downloadUrl?: string;
 }
 
-/** Which libraries to query. pexels/pixabay/archive give VIDEO (+ photos for the
- *  first two); openverse/wikimedia give CC images. Default = the four free,
- *  no-/light-attribution libraries; "archive" is opt-in. */
+/** Which libraries to query, in order. Default Pexels + Pixabay. */
 function configuredFootageSources(): string[] {
-  const raw = getSetting("FOOTAGE_SOURCES") || "pexels,pixabay,openverse,wikimedia";
-  const known = new Set(["pexels", "pixabay", "openverse", "wikimedia", "archive"]);
+  const raw = getSetting("FOOTAGE_SOURCES") || "pexels,pixabay";
+  const known = new Set(["pexels", "pixabay"]);
   const list = raw
     .split(/[\n,;]+/)
     .map((s) => s.trim().toLowerCase())
     .filter((s) => known.has(s));
-  return list.length > 0 ? [...new Set(list)] : ["pexels", "pixabay", "openverse", "wikimedia"];
+  return list.length > 0 ? [...new Set(list)] : ["pexels", "pixabay"];
 }
 
 /** Generic stream-download (used by Pixabay + any direct-URL source). */
-async function downloadUrlToFile(url: string, outPath: string): Promise<void> {
+async function downloadUrlToFile(url: string, outPath: string, runId?: string): Promise<void> {
+  const isPixabay = url.includes("pixabay.com");
+  if (isPixabay && isPixabaySuspended()) {
+    throw new Error("Pixabay downloads temporarily rate-limited — in cooldown");
+  }
+
+  if (runId && isPixabay) {
+    getOrCreateStats(runId).pixabayCalls++;
+  }
   const resp = await fetch(url, { headers: { "User-Agent": FOOTAGE_UA } });
+  if (resp.status === 429) {
+    if (isPixabay) {
+      setPixabayCooldown();
+      getOrCreateStats(runId || "").pixabay429s++;
+      log(runId || "", "warn", "Pixabay downloads temporarily rate-limited — cooling down for 120s", { stage: "animate" });
+    }
+    throw new Error(`download HTTP ${resp.status}`);
+  }
+
   if (!resp.ok) throw new Error(`download HTTP ${resp.status}`);
   const buf = Buffer.from(await resp.arrayBuffer());
   if (buf.byteLength === 0) throw new Error("download: empty file");
@@ -587,6 +879,7 @@ async function pexelsVideoHits(
       sourceUrl: v.url,
       meta: `${file.width}x${file.height} ${v.duration}s`,
       download: (out) => downloadPexelsVideo(file, out),
+      pexelsVideoFile: file,
     });
   }
   return hits;
@@ -612,6 +905,7 @@ async function pexelsPhotoHits(
       sourceUrl: p.url,
       meta: `${p.width}x${p.height}`,
       download: (out) => downloadPexelsPhoto(url, out),
+      pexelsPhotoUrl: url,
     };
   });
 }
@@ -642,7 +936,7 @@ function pixabayDesc(tags: string | undefined, pageURL: string | undefined): str
 
 async function pixabayVideoHits(
   query: string,
-  opts: { orientation: Orientation; minDuration: number }
+  opts: { orientation: Orientation; minDuration: number; runId: string }
 ): Promise<FootageHit[]> {
   const key = getSetting("PIXABAY_API_KEY").trim();
   if (!key) return [];
@@ -655,7 +949,15 @@ async function pixabayVideoHits(
   const orient = pixabayOrientation(opts.orientation);
   if (orient) url.searchParams.set("orientation", orient);
 
+  if (opts.runId) {
+    getOrCreateStats(opts.runId).pixabayCalls++;
+  }
   const resp = await fetch(url, { headers: { "User-Agent": FOOTAGE_UA } });
+  if (resp.status === 429) {
+    setPixabayCooldown();
+    if (opts.runId) getOrCreateStats(opts.runId).pixabay429s++;
+    throw new Error("Pixabay videos HTTP 429");
+  }
   if (!resp.ok) throw new Error(`Pixabay videos HTTP ${resp.status}`);
   const data = (await resp.json()) as {
     hits?: {
@@ -680,7 +982,8 @@ async function pixabayVideoHits(
       author: h.user ?? null,
       sourceUrl: h.pageURL ?? "",
       meta: `${v.width}x${v.height}${h.duration ? ` ${h.duration}s` : ""}`,
-      download: (out) => downloadUrlToFile(fileUrl, out),
+      download: (out) => downloadUrlToFile(fileUrl, out, opts.runId),
+      downloadUrl: fileUrl,
     });
   }
   return hits;
@@ -688,7 +991,7 @@ async function pixabayVideoHits(
 
 async function pixabayPhotoHits(
   query: string,
-  opts: { orientation: Orientation }
+  opts: { orientation: Orientation; runId: string }
 ): Promise<FootageHit[]> {
   const key = getSetting("PIXABAY_API_KEY").trim();
   if (!key) return [];
@@ -702,7 +1005,15 @@ async function pixabayPhotoHits(
   const orient = pixabayOrientation(opts.orientation);
   if (orient) url.searchParams.set("orientation", orient);
 
+  if (opts.runId) {
+    getOrCreateStats(opts.runId).pixabayCalls++;
+  }
   const resp = await fetch(url, { headers: { "User-Agent": FOOTAGE_UA } });
+  if (resp.status === 429) {
+    setPixabayCooldown();
+    if (opts.runId) getOrCreateStats(opts.runId).pixabay429s++;
+    throw new Error("Pixabay images HTTP 429");
+  }
   if (!resp.ok) throw new Error(`Pixabay images HTTP ${resp.status}`);
   const data = (await resp.json()) as {
     hits?: {
@@ -730,153 +1041,15 @@ async function pixabayPhotoHits(
       author: h.user ?? null,
       sourceUrl: h.pageURL ?? "",
       meta: h.imageWidth && h.imageHeight ? `${h.imageWidth}x${h.imageHeight}` : "photo",
-      download: (out) => downloadUrlToFile(imgUrl, out),
+      download: (out) => downloadUrlToFile(imgUrl, out, opts.runId),
+      downloadUrl: imgUrl,
     });
-  }
-  return hits;
-}
-
-// ── CC / public-domain sources: Openverse + Wikimedia (images), Archive (video)
-//
-// Ported from Conveyer Patrice. These WIDEN coverage for niche scenes Pexels/
-// Pixabay lack. IMPORTANT: unlike Pexels/Pixabay, most of these are CC-licensed
-// and REQUIRE attribution (author + source) in the video description — the run
-// log prints author/source/license for every chosen clip so it can be credited.
-
-/** Cleans a title-ish string into scoreable words ("File:Old pharmacy 1920.jpg"
- *  → "Old pharmacy"). */
-function titleWords(s: string): string {
-  return s
-    .replace(/^File:/i, "")
-    .replace(/\.[a-z0-9]{2,4}$/i, "")
-    .replace(/[_-]+/g, " ")
-    .replace(/<[^>]+>/g, "")
-    .trim();
-}
-
-/** Openverse — huge CC image pool. Optional OPENVERSE_TOKEN raises rate limits. */
-async function openverseHits(query: string): Promise<FootageHit[]> {
-  const url = new URL("https://api.openverse.org/v1/images/");
-  url.searchParams.set("q", query);
-  url.searchParams.set("license", "pdm,cc0,by,by-sa");
-  url.searchParams.set("license_type", "commercial,modification");
-  url.searchParams.set("page_size", "20");
-  const headers: Record<string, string> = { "User-Agent": FOOTAGE_UA };
-  const token = getSetting("OPENVERSE_TOKEN").trim();
-  if (token) headers.Authorization = `Bearer ${token}`;
-  const resp = await fetch(url, { headers });
-  if (!resp.ok) throw new Error(`Openverse ${resp.status}`);
-  const data = (await resp.json()) as {
-    results?: { id: string; url?: string; thumbnail?: string; title?: string; creator?: string; foreign_landing_url?: string; license?: string; tags?: { name?: string }[] }[];
-  };
-  const hits: FootageHit[] = [];
-  for (const r of data.results ?? []) {
-    if (!r.url) continue;
-    const tags = (r.tags ?? []).map((t) => t.name).filter(Boolean).join(" ");
-    const imgUrl = r.url;
-    hits.push({
-      source: "openverse",
-      dedupeId: `openverse:${r.id}`,
-      desc: `${titleWords(r.title || "")} ${tags}`.trim(),
-      thumbUrl: r.thumbnail || imgUrl,
-      author: r.creator ?? null,
-      sourceUrl: r.foreign_landing_url ?? "",
-      meta: `openverse image (${r.license ?? "CC"})`,
-      download: (out) => downloadUrlToFile(imgUrl, out),
-    });
-  }
-  return hits;
-}
-
-/** Wikimedia Commons — encyclopedic stills (great for places, history, objects). */
-async function wikimediaHits(query: string): Promise<FootageHit[]> {
-  const url = new URL("https://commons.wikimedia.org/w/api.php");
-  url.searchParams.set("action", "query");
-  url.searchParams.set("format", "json");
-  url.searchParams.set("generator", "search");
-  url.searchParams.set("gsrsearch", query);
-  url.searchParams.set("gsrnamespace", "6");
-  url.searchParams.set("gsrlimit", "20");
-  url.searchParams.set("prop", "imageinfo");
-  url.searchParams.set("iiprop", "url|size|mime|extmetadata");
-  url.searchParams.set("iiurlwidth", "1600");
-  const resp = await fetch(url, { headers: { "User-Agent": FOOTAGE_UA } });
-  if (!resp.ok) throw new Error(`Wikimedia ${resp.status}`);
-  const data = (await resp.json()) as {
-    query?: { pages?: Record<string, { title?: string; imageinfo?: { url?: string; thumburl?: string; mime?: string; descriptionurl?: string; extmetadata?: Record<string, { value?: string }> }[] }> };
-  };
-  const pages = data.query?.pages ? Object.values(data.query.pages) : [];
-  const hits: FootageHit[] = [];
-  for (const p of pages) {
-    const info = p.imageinfo?.[0];
-    if (!info || !/^image\//.test(info.mime ?? "")) continue; // stills only (Commons video is webm)
-    const full = info.thumburl || info.url;
-    if (!full) continue;
-    hits.push({
-      source: "wikimedia",
-      dedupeId: `wikimedia:${p.title}`,
-      desc: titleWords(p.title || ""),
-      thumbUrl: info.thumburl || full,
-      author: info.extmetadata?.Artist?.value?.replace(/<[^>]+>/g, "").slice(0, 120) ?? null,
-      sourceUrl: info.descriptionurl ?? "",
-      meta: `wikimedia image (${info.extmetadata?.LicenseShortName?.value ?? "CC"})`,
-      download: (out) => downloadUrlToFile(full, out),
-    });
-  }
-  return hits;
-}
-
-/** Internet Archive — vast CC/public-domain VIDEO pool (vintage/educational/news).
- *  Two-step: search for ids, then pick a small (<80MB) mp4 derivative. */
-async function archiveHits(query: string): Promise<FootageHit[]> {
-  const search = new URL("https://archive.org/advancedsearch.php");
-  search.searchParams.set("q", `(${query.slice(0, 120)}) AND mediatype:(movies)`);
-  search.searchParams.append("fl[]", "identifier");
-  search.searchParams.append("sort[]", "downloads desc");
-  search.searchParams.set("rows", "6");
-  search.searchParams.set("output", "json");
-  const resp = await fetch(search, { headers: { "User-Agent": FOOTAGE_UA } });
-  if (!resp.ok) throw new Error(`archive.org search ${resp.status}`);
-  const data = (await resp.json()) as { response?: { docs?: { identifier?: string }[] } };
-  const docs = (data.response?.docs ?? []).filter((d) => d.identifier).slice(0, 4);
-
-  const hits: FootageHit[] = [];
-  for (const d of docs) {
-    try {
-      const metaResp = await fetch(`https://archive.org/metadata/${encodeURIComponent(d.identifier!)}`, {
-        headers: { "User-Agent": FOOTAGE_UA },
-      });
-      if (!metaResp.ok) continue;
-      const meta = (await metaResp.json()) as {
-        files?: { name?: string; size?: string }[];
-        metadata?: { title?: string; creator?: string; licenseurl?: string };
-      };
-      const mp4 = (meta.files ?? [])
-        .filter((f) => f.name?.toLowerCase().endsWith(".mp4") && Number(f.size || 0) > 0 && Number(f.size) < 80 * 1024 * 1024)
-        .sort((a, b) => Number(a.size) - Number(b.size))[0];
-      if (!mp4?.name) continue;
-      const fileUrl = `https://archive.org/download/${encodeURIComponent(d.identifier!)}/${encodeURIComponent(mp4.name)}`;
-      hits.push({
-        source: "archive",
-        dedupeId: `archive:${d.identifier}`,
-        desc: titleWords(meta.metadata?.title || d.identifier || ""),
-        thumbUrl: `https://archive.org/services/img/${encodeURIComponent(d.identifier!)}`,
-        author: meta.metadata?.creator ?? null,
-        sourceUrl: `https://archive.org/details/${encodeURIComponent(d.identifier!)}`,
-        meta: `archive.org video (${meta.metadata?.licenseurl ? "see item" : "item license"})`,
-        download: (out) => downloadUrlToFile(fileUrl, out),
-      });
-    } catch {
-      // skip this item, keep the rest
-    }
   }
   return hits;
 }
 
 /** Query EVERY configured source for one query, pool the normalized hits.
- *  A source that errors is logged and skipped (never fails the whole gather).
- *  Sources only run for the kinds they provide: video sources for video scenes,
- *  image sources for photo scenes. */
+ *  A source that errors is logged and skipped (never fails the whole gather). */
 async function gatherHits(
   kind: "video" | "photo",
   query: string,
@@ -884,18 +1057,78 @@ async function gatherHits(
 ): Promise<FootageHit[]> {
   const sources = configuredFootageSources();
   const tasks = sources.map(async (src): Promise<FootageHit[]> => {
+    const cacheKey = `${src}:${kind}:${opts.orientation}:${query.trim().toLowerCase()}`;
+
+    // 1. Check Search Cache
     try {
-      if (kind === "video") {
-        if (src === "pexels") return await pexelsVideoHits(query, opts);
-        if (src === "pixabay") return await pixabayVideoHits(query, { orientation: opts.orientation, minDuration: opts.minDuration });
-        if (src === "archive") return await archiveHits(query);
-        return []; // image-only source on a video scene
+      const cached = getSearchCacheStmt.get(cacheKey) as { value: string; created_at: number } | undefined;
+      if (cached) {
+        const now = Date.now();
+        const ageMs = now - cached.created_at;
+        if (ageMs < 24 * 60 * 60 * 1000) { // 24h TTL
+          const parsed = JSON.parse(cached.value) as any[];
+          const deserialized = parsed.map((sh) => deserializeHit(sh, opts.runId));
+          getOrCreateStats(opts.runId).cacheHits++;
+          log(opts.runId, "debug", `Search cache hit for ${src} ${kind}: "${query}"`, { stage: "animate" });
+          return deserialized;
+        }
       }
-      if (src === "pexels") return await pexelsPhotoHits(query, opts);
-      if (src === "pixabay") return await pixabayPhotoHits(query, { orientation: opts.orientation });
-      if (src === "openverse") return await openverseHits(query);
-      if (src === "wikimedia") return await wikimediaHits(query);
-      return []; // video-only source (archive) on a photo scene
+    } catch (e) {
+      // ignore
+    }
+
+    // 2. Cooldown check before API calls
+    if (src === "pexels") {
+      if (isPexelsSuspended()) {
+        const now = Date.now();
+        if (now - lastAllPexelsKeysLimitedLogTime > 60000) {
+          lastAllPexelsKeysLimitedLogTime = now;
+          log(opts.runId, "warn", "All Pexels keys are currently rate-limited — skipping Pexels searches, continuing with cache and Pixabay if available", { stage: "animate" });
+        }
+        return [];
+      }
+    } else if (src === "pixabay") {
+      if (isPixabaySuspended()) {
+        log(opts.runId, "debug", `Pixabay search skipped (suspended due to rate limit): "${query}"`, { stage: "animate" });
+        return [];
+      }
+    }
+
+    // 3. API Call on Cache Miss
+    getOrCreateStats(opts.runId).cacheMisses++;
+    try {
+      let hits: FootageHit[] = [];
+      if (src === "pexels") {
+        hits = kind === "video"
+          ? await pexelsVideoHits(query, opts)
+          : await pexelsPhotoHits(query, opts);
+      } else if (src === "pixabay") {
+        hits = kind === "video"
+          ? await pixabayVideoHits(query, { orientation: opts.orientation, minDuration: opts.minDuration, runId: opts.runId })
+          : await pixabayPhotoHits(query, { orientation: opts.orientation, runId: opts.runId });
+      }
+
+      // 4. Save to Search Cache if hits found
+      if (hits.length > 0) {
+        const serializable = hits.map((h) => ({
+          source: h.source,
+          dedupeId: h.dedupeId,
+          desc: h.desc,
+          thumbUrl: h.thumbUrl,
+          author: h.author,
+          sourceUrl: h.sourceUrl,
+          meta: h.meta,
+          pexelsVideoFile: h.pexelsVideoFile,
+          pexelsPhotoUrl: h.pexelsPhotoUrl,
+          downloadUrl: h.downloadUrl,
+        }));
+        try {
+          insertSearchCacheStmt.run(cacheKey, JSON.stringify(serializable), Date.now());
+        } catch (e) {
+          // ignore
+        }
+      }
+      return hits;
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       log(opts.runId, "debug", `${src} ${kind} search failed for "${query}": ${msg.slice(0, 120)}`, {
@@ -904,8 +1137,8 @@ async function gatherHits(
       return [];
     }
   });
+
   const results = await Promise.all(tasks);
-  // Dedupe across sources (defensive — ids are namespaced so collisions are rare).
   const seen = new Set<string>();
   const out: FootageHit[] = [];
   for (const h of results.flat()) {
@@ -943,13 +1176,23 @@ function broadenQuery(query: string, level: number): string {
 /**
  * VISION relevance — Gemini LOOKS AT each candidate's thumbnail (not its text)
  * and scores 0..1 how well the IMAGE fits (a) this scene's narration moment and
- * (b) the whole video's context. Judges EVERY candidate, in batches of ≤BATCH
- * thumbnails per call (Gemini caps images-per-request), merging the scores — up
- * to a HARD_CEIL safety bound so a huge pool can't blow up payload/cost. Returns
- * a dedupeId→score map (empty entries fall back to the local text score in the
- * caller), or null when disabled / no key / no usable thumbnails. A batch that
- * errors is skipped (its candidates fall back) — the run is NEVER blocked.
+ * (b) the whole video's context. One call, up to `MAX` thumbnails attached.
+ * Returns scores per hit, or null when disabled / no key / no usable thumbnails
+ * / any error — the caller then falls back to the local text score, so a run is
+ * NEVER blocked by the vision step.
  */
+const visionLimits = new Map<string, any>();
+
+function getVisionLimitForRun(runId: string): any {
+  let lim = visionLimits.get(runId);
+  if (!lim) {
+    const limitVal = Math.max(1, Number(getSetting("VISION_CONCURRENCY") || "2"));
+    lim = pLimit(limitVal);
+    visionLimits.set(runId, lim);
+  }
+  return lim;
+}
+
 async function aiScoreHitsByVision(
   runId: string,
   sceneText: string,
@@ -960,67 +1203,133 @@ async function aiScoreHitsByVision(
   const apiKey = getSetting("GOOGLE_API_KEY").trim();
   if (!apiKey) return null;
 
-  const HARD_CEIL = 40; // most candidates Vision will judge for one scene/attempt
-  const BATCH = 12; // thumbnails per Gemini call (safe for images-per-request)
-  const withThumb = hits.filter((h) => h.thumbUrl).slice(0, HARD_CEIL);
-  if (withThumb.length === 0) return null;
+  if (isVisionCooldown()) {
+    return null;
+  }
 
-  const thumbs = await Promise.all(withThumb.map((h) => fetchThumbInline(h.thumbUrl)));
-  const usable = withThumb
-    .map((h, i) => ({ h, t: thumbs[i] }))
-    .filter((x): x is { h: FootageHit; t: { data: string; mime: string } } => x.t !== null);
-  if (usable.length === 0) return null;
+  const model = getSetting("GEMINI_VISION_MODEL") || "gemini-flash-latest";
+  const visualIntentRepr = `intent:${sceneText} context:${videoContext}`;
+  const intentHash = getShortHash(visualIntentRepr);
 
-  const model = getSetting("SCENE_SPLIT_MODEL") || "gemini-flash-latest";
-  const result = new Map<string, number>();
+  const scoresMap = new Map<string, number>();
+  const toQuery: FootageHit[] = [];
 
-  const scoreBatch = async (batch: { h: FootageHit; t: { data: string; mime: string } }[]) => {
+  for (const h of hits) {
+    const key = `${model}:${h.dedupeId}:${intentHash}`;
+    let cachedScore: number | null = null;
+    try {
+      const cached = getVisionCacheStmt.get(key) as { score: number; created_at: number } | undefined;
+      if (cached) {
+        const now = Date.now();
+        if (now - cached.created_at < 7 * 24 * 60 * 60 * 1000) {
+          cachedScore = cached.score;
+        }
+      }
+    } catch (e) {
+      // ignore
+    }
+
+    if (cachedScore !== null) {
+      scoresMap.set(h.dedupeId, cachedScore);
+      getOrCreateStats(runId).cacheHits++;
+    } else {
+      toQuery.push(h);
+      getOrCreateStats(runId).cacheMisses++;
+    }
+  }
+
+  if (toQuery.length === 0) {
+    return scoresMap;
+  }
+
+  const limit = getVisionLimitForRun(runId);
+  return limit(async () => {
+    if (isVisionCooldown()) {
+      return scoresMap.size > 0 ? scoresMap : null;
+    }
+
+    const MAX = Math.max(1, Number(getSetting("VISION_CANDIDATE_LIMIT") || "8"));
+    const subset = toQuery.filter((h) => h.thumbUrl).slice(0, MAX);
+    if (subset.length === 0) {
+      return scoresMap.size > 0 ? scoresMap : null;
+    }
+
+    const thumbs = await Promise.all(subset.map((h) => fetchThumbInline(h.thumbUrl)));
+    const usable = subset
+      .map((h, i) => ({ h, t: thumbs[i] }))
+      .filter((x): x is { h: FootageHit; t: { data: string; mime: string } } => x.t !== null);
+    if (usable.length === 0) {
+      return scoresMap.size > 0 ? scoresMap : null;
+    }
+
+    getOrCreateStats(runId).geminiVisionCalls++;
+
     const parts: unknown[] = [
       {
         text:
           `You are choosing B-roll footage for ONE moment of a video.\n` +
           (videoContext ? `The whole video is about: "${videoContext.slice(0, 300)}".\n` : "") +
           `This moment's narration: "${sceneText.slice(0, 300)}".\n\n` +
-          `${batch.length} candidate images follow, each labelled "index N". LOOK AT EACH IMAGE and score 0-100 how well what is ACTUALLY SHOWN fits this moment AND the video's overall context (100 = perfect on-screen match). Judge only by the visible content, not by any text.\n` +
-          `Return STRICTLY a JSON array [{"i":<N>,"score":<int>}] covering all ${batch.length}. No markdown.`,
+          `${usable.length} candidate images follow, each labelled "index N". LOOK AT EACH IMAGE and score 0-100 how well what is ACTUALLY SHOWN fits this moment AND the video's overall context (100 = perfect on-screen match). Judge only by the visible content, not by any text.\n` +
+          `Return STRICTLY a JSON array [{"i":<N>,"score":<int>}] covering all ${usable.length}. No markdown.`,
       },
     ];
-    batch.forEach((x, i) => {
+    usable.forEach((x, i) => {
       parts.push({ text: `index ${i}` });
       parts.push({ inlineData: { mimeType: x.t.mime, data: x.t.data } });
     });
-    const r = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ role: "user", parts }],
-          generationConfig: { responseMimeType: "application/json", temperature: 0, maxOutputTokens: 2000, thinkingConfig: { thinkingBudget: 0 } },
-        }),
-      }
-    );
-    if (!r.ok) throw new Error(`Gemini vision ${r.status}`);
-    const j = (await r.json()) as { candidates?: { content?: { parts?: { text?: string }[] } }[] };
-    const text = j.candidates?.[0]?.content?.parts?.map((p) => p.text ?? "").join("") ?? "";
-    const arr = JSON.parse(text.match(/\[[\s\S]*\]/)?.[0] ?? text) as { i: number; score: number }[];
-    for (const a of arr) {
-      const u = batch[Number(a.i)];
-      if (u) result.set(u.h.dedupeId, Math.max(0, Math.min(100, Number(a.score))) / 100);
-    }
-  };
 
-  // Judge ALL candidates, one batch (call) at a time. A failed batch is skipped.
-  for (let i = 0; i < usable.length; i += BATCH) {
     try {
-      await scoreBatch(usable.slice(i, i + BATCH));
+      log(runId, "debug", `Gemini vision scoring with model ${model}`, { stage: "animate" });
+
+      const r = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ role: "user", parts }],
+            generationConfig: { responseMimeType: "application/json", temperature: 0, maxOutputTokens: 2000, thinkingConfig: { thinkingBudget: 0 } },
+          }),
+        }
+      );
+      if (!r.ok) {
+        if (r.status === 429) {
+          getOrCreateStats(runId).geminiVision429s++;
+          setVisionCooldown();
+          log(runId, "warn", "Gemini Vision rate-limited — cooling down for 120s, using text score temporarily", { stage: "animate" });
+          throw new Error("Gemini Vision 429");
+        }
+        if (r.status === 404) {
+          throw new Error(`Gemini vision 404 using model ${model}`);
+        }
+        throw new Error(`Gemini vision ${r.status}`);
+      }
+      const j = (await r.json()) as { candidates?: { content?: { parts?: { text?: string }[] } }[] };
+      const text = j.candidates?.[0]?.content?.parts?.map((p) => p.text ?? "").join("") ?? "";
+      const arr = JSON.parse(text.match(/\[[\s\S]*\]/)?.[0] ?? text) as { i: number; score: number }[];
+      
+      for (const x of arr) {
+        const u = usable[Number(x.i)];
+        if (u) {
+          const scoreVal = Math.max(0, Math.min(100, Number(x.score))) / 100;
+          const key = `${model}:${u.h.dedupeId}:${intentHash}`;
+          try {
+            insertVisionCacheStmt.run(key, scoreVal, Date.now());
+          } catch (e) {
+            // ignore
+          }
+          scoresMap.set(u.h.dedupeId, scoreVal);
+        }
+      }
+      return scoresMap.size > 0 ? scoresMap : null;
     } catch (e) {
-      log(runId, "debug", `Vision batch ${i / BATCH + 1} failed (those fall back to text): ${(e as Error).message.slice(0, 90)}`, {
+      log(runId, "debug", `Vision scoring unavailable (fallback to text score): ${(e as Error).message.slice(0, 100)}`, {
         stage: "animate",
       });
+      return scoresMap.size > 0 ? scoresMap : null;
     }
-  }
-  return result.size > 0 ? result : null;
+  });
 }
 
 interface PoolHit {
@@ -1054,8 +1363,8 @@ async function acquireFootage(
   scene: Scene,
   outPath: string,
   options: AcquireOptions
-): Promise<{ author: string | null; sourceUrl: string; source: string }> {
-  const { runId, orientation = "landscape", maxHeight = 1080, minDuration = 4, usedIds, videoContext = "" } = options;
+): Promise<{ author: string | null; sourceUrl: string; source: string; dedupeId: string }> {
+  const { runId, orientation = "landscape", maxHeight = 1080, minDuration = 4, usedIds, avoidDedupeIds, videoContext = "", anchorWords } = options;
   const gatherOpts = { runId, orientation, maxHeight, minDuration };
 
   const baseQueries = sceneQueryCandidates(scene);
@@ -1065,24 +1374,35 @@ async function acquireFootage(
   const queryTokenLists = baseQueries.map(relevanceTokens);
   let lastErr: unknown;
 
-  const tryList = async (list: PoolHit[]) => {
+  const tryList = async (list: PoolHit[], ignoreAvoidList = false) => {
     if (list.length === 0) return null;
     const fresh = usedIds && usedIds.size > 0 ? list.filter((s) => !usedIds.has(s.hit.dedupeId)) : list;
     const ordered = fresh.length > 0 ? fresh : list;
     const reusing = fresh.length === 0 && usedIds && usedIds.size > 0;
     for (const s of ordered) {
       if (usedIds && usedIds.has(s.hit.dedupeId) && !reusing) continue;
+
+      if (!ignoreAvoidList && avoidDedupeIds && avoidDedupeIds.has(s.hit.dedupeId)) {
+        log(runId, "warn", `Skipping adjacent duplicate footage: ${s.hit.dedupeId}`, { stage: "animate" });
+        continue;
+      }
+
       if (usedIds && !usedIds.has(s.hit.dedupeId)) usedIds.add(s.hit.dedupeId);
       try {
-        await s.hit.download(outPath);
+        await downloadWithCache(s.hit, outPath, runId);
         const reusedTag = reusing ? " (reused — no fresh matches)" : "";
+
+        if (ignoreAvoidList && avoidDedupeIds && avoidDedupeIds.has(s.hit.dedupeId)) {
+          log(runId, "warn", `Adjacent duplicate allowed only because no alternative footage was found`, { stage: "animate" });
+        }
+
         log(
           runId,
           "info",
           `${kind} via ${s.hit.source}: ${s.hit.dedupeId} ${s.hit.meta} by ${s.hit.author ?? "?"}${reusedTag} [${s.via} match ${(s.score * 100).toFixed(0)}% · "${s.query}"]`,
           { stage: "animate", data: { source: s.hit.source, author: s.hit.author, sourceUrl: s.hit.sourceUrl } }
         );
-        return { author: s.hit.author, sourceUrl: s.hit.sourceUrl, source: s.hit.source };
+        return { author: s.hit.author, sourceUrl: s.hit.sourceUrl, source: s.hit.source, dedupeId: s.hit.dedupeId };
       } catch (e) {
         if (usedIds && !reusing) usedIds.delete(s.hit.dedupeId);
         lastErr = e;
@@ -1099,11 +1419,13 @@ async function acquireFootage(
   const pool: PoolHit[] = [];
   const seen = new Set<string>();
 
-  // Up to 3 search attempts; broaden the query each round to widen the net.
-  for (let attempt = 0; attempt < 3; attempt++) {
+  const maxAttempts = Math.max(1, Number(getSetting("FOOTAGE_SEARCH_ATTEMPTS") || "3"));
+
+  // Up to maxAttempts search attempts; broaden the query each round to widen the net.
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const baseQuery = baseQueries[Math.min(attempt, baseQueries.length - 1)];
     const query = attempt < baseQueries.length ? baseQuery : broadenQuery(baseQueries[0], attempt);
-    log(runId, "debug", `Footage search [${configuredFootageSources().join("+")}] attempt ${attempt + 1}/3: "${query}"`, {
+    log(runId, "debug", `Footage search [${configuredFootageSources().join("+")}] attempt ${attempt + 1}/${maxAttempts}: "${query}"`, {
       stage: "animate",
     });
 
@@ -1114,13 +1436,28 @@ async function acquireFootage(
     }
     hits.forEach((h) => seen.add(h.dedupeId));
 
-    // Local text score — only ORDERS candidates (Vision judges ALL of them, with
-    // a safety cap inside aiScoreHitsByVision) and is the fallback score when
-    // Vision is unavailable.
+    // Local text score — used to pre-pick which thumbnails to send to vision,
+    // and as the fallback score when vision is unavailable.
     const localScored = hits
-      .map((h) => ({ hit: h, local: relevanceScore(relevanceTokens(h.desc), queryTokenLists) }))
+      .map((h) => ({ hit: h, local: relevanceScore(relevanceTokens(h.desc), queryTokenLists, anchorWords) }))
       .sort((a, b) => b.local - a.local);
-    const toScore = localScored.map((x) => x.hit);
+
+    // Apply avoid/filtering before vision scoring:
+    let candidatesToScore = localScored.filter(x => {
+      // Exclude adjacent duplicate IDs from vision checks
+      if (avoidDedupeIds && avoidDedupeIds.has(x.hit.dedupeId)) {
+        return false;
+      }
+      return x.local > 0; // Don't send completely bad matches to Vision
+    });
+
+    // Fallback: if everything is filtered out but we have hits, let's keep them so we don't return nothing
+    if (candidatesToScore.length === 0 && localScored.length > 0) {
+      candidatesToScore = localScored;
+    }
+
+    const visLimit = Math.max(1, Number(getSetting("VISION_CANDIDATE_LIMIT") || "8"));
+    const toScore = candidatesToScore.slice(0, visLimit).map((x) => x.hit);
 
     const vision = await aiScoreHitsByVision(runId, scene.text, videoContext, toScore);
     for (const x of localScored) {
@@ -1138,14 +1475,14 @@ async function acquireFootage(
     if (pool[0] && pool[0].score >= VISION_TIERS[0]) {
       const got = await tryList(pool.filter((p) => p.score >= VISION_TIERS[0]));
       if (got) return got;
-    } else if (attempt < 2) {
+    } else if (attempt < maxAttempts - 1) {
       log(runId, "debug", `Best so far ${((pool[0]?.score ?? 0) * 100).toFixed(0)}% < 80% — broadening`, {
         stage: "animate",
       });
     }
   }
 
-  // No ≥80% match after 3 attempts — descend the bar over everything found.
+  // No ≥80% match after maxAttempts attempts — descend the bar over everything found.
   if (pool.length > 0) {
     pool.sort((a, b) => b.score - a.score);
     for (const tier of VISION_TIERS) {
@@ -1164,6 +1501,15 @@ async function acquireFootage(
       stage: "animate",
     });
     const got = await tryList(pool);
+    if (got) return got;
+  }
+
+  // Last resort: if we got nothing because of avoid list, try pool again allowing avoided assets
+  if (pool.length > 0 && avoidDedupeIds && avoidDedupeIds.size > 0) {
+    log(runId, "warn", `Scene #${scene.index}: all candidates skipped due to adjacent duplicate. Retrying with duplicate allowed as fallback.`, {
+      stage: "animate",
+    });
+    const got = await tryList(pool, true);
     if (got) return got;
   }
 
@@ -1188,8 +1534,11 @@ export interface AcquireOptions {
    * Pass a fresh `new Set<string>()` per pipeline run.
    */
   usedIds?: Set<string>;
+  /** Set of asset ids to avoid for adjacent duplicates. */
+  avoidDedupeIds?: Set<string>;
   /** One-line summary of the whole video, for the vision relevance scorer. */
   videoContext?: string;
+  anchorWords?: string[];
 }
 
 /**
@@ -1208,7 +1557,7 @@ export async function acquireStockClipForScene(
   scene: Scene,
   outPath: string,
   options: AcquireOptions
-): Promise<{ author: string | null; sourceUrl: string; source: string }> {
+): Promise<{ author: string | null; sourceUrl: string; source: string; dedupeId: string }> {
   return acquireFootage("video", scene, outPath, options);
 }
 
@@ -1222,8 +1571,11 @@ export interface AcquirePhotoOptions {
    *  this run. Kept SEPARATE from the video set (a video and a photo can share an
    *  id within a source, but they're distinct assets). Pass `new Set<string>()`. */
   usedIds?: Set<string>;
+  /** Set of asset ids to avoid for adjacent duplicates. */
+  avoidDedupeIds?: Set<string>;
   /** One-line summary of the whole video, for the vision relevance scorer. */
   videoContext?: string;
+  anchorWords?: string[];
 }
 
 /**
@@ -1238,6 +1590,23 @@ export async function acquireStockPhotoForScene(
   scene: Scene,
   outPath: string,
   options: AcquirePhotoOptions
-): Promise<{ author: string | null; sourceUrl: string; source: string }> {
+): Promise<{ author: string | null; sourceUrl: string; source: string; dedupeId: string }> {
   return acquireFootage("photo", scene, outPath, options);
+}
+
+export function logRunStats(runId: string) {
+  const stats = getOrCreateStats(runId);
+  const report = [
+    "Stock usage summary:",
+    `* Pexels API calls: ${stats.pexelsCalls}`,
+    `* Pixabay API calls: ${stats.pixabayCalls}`,
+    `* Gemini Vision calls: ${stats.geminiVisionCalls}`,
+    `* Cache hits: ${stats.cacheHits}`,
+    `* Cache misses: ${stats.cacheMisses}`,
+    `* Pexels 429 count: ${stats.pexels429s}`,
+    `* Pixabay 429 count: ${stats.pixabay429s}`,
+    `* Gemini Vision 429 count: ${stats.geminiVision429s}`,
+    `* Assets reused from cache: ${stats.assetsReusedFromCache}`
+  ].join("\n");
+  log(runId, "success", report, { stage: "pipeline" });
 }

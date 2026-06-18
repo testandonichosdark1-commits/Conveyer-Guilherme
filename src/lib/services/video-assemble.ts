@@ -22,7 +22,21 @@ export interface OverlaySpec {
   text: string;
   /** Start time LOCAL to this clip, in seconds (clamped during render). */
   atSec: number;
+  /** Optional custom display duration in seconds. */
+  duration?: number;
 }
+
+/** Custom step overlay specification. */
+export interface StepOverlaySpec {
+  stepNum: string;      // e.g. "1"
+  title: string;        // formatted title: "COLLECT & CHOP KITCHEN SCRAPS"
+  rawTitle: string;     // raw title: "Collect and chop your kitchen scraps"
+  startMs?: number;     // calculated start timestamp (from Whisper)
+  endMs?: number;       // calculated end timestamp (from Whisper + trail)
+  atSec?: number;       // start relative to plan clip
+  duration?: number;    // duration in seconds
+}
+
 
 export interface AssembleInput {
   scene: Scene;
@@ -31,7 +45,11 @@ export interface AssembleInput {
   audio: TtsResult;
   /** Optional big fading caption burned into this clip. */
   overlay?: OverlaySpec;
+  /** Optional step overlay. */
+  stepOverlay?: StepOverlaySpec;
+  dedupeId?: string;
 }
+
 
 /**
  * Builds the final video:
@@ -75,10 +93,10 @@ export async function assembleVideo(
         const audioDuration = await probeDuration(item.audio.filePath);
         const clipDuration = audioDuration + tailSilence;
         if (item.videoPath) {
-          await renderAnimatedClip(item.videoPath, item.audio.filePath, clipPath, w, h, fps, clipDuration, tailSilence, item.overlay);
+          await renderAnimatedClip(item.videoPath, item.audio.filePath, clipPath, w, h, fps, clipDuration, tailSilence, item.overlay, item.stepOverlay);
         } else {
           const zoomDirection: "in" | "out" = Math.random() < 0.5 ? "in" : "out";
-          await renderKenBurnsClip(item.imagePath, item.audio.filePath, clipPath, w, h, fps, clipDuration, zoomDirection, tailSilence, item.overlay);
+          await renderKenBurnsClip(item.imagePath, item.audio.filePath, clipPath, w, h, fps, clipDuration, zoomDirection, tailSilence, item.overlay, item.stepOverlay);
         }
         log(
           runId,
@@ -296,6 +314,104 @@ function sanitizeOverlayText(s: string): string {
     .slice(0, 16);
 }
 
+/** Keeps only characters that are safe AND meaningful in a step overlay caption. */
+function sanitizeStepOverlayText(s: string): string {
+  return s
+    .replace(/[^A-Za-z0-9 $%.,+\-&]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 100);
+}
+
+/**
+ * Builds double drawtext filters for Step Overlay: Line 1 "STEP X" and Line 2 "TITLE".
+ * Returns them joined by comma, or null when there's no usable font.
+ */
+function buildStepOverlayDrawtext(
+  stepOverlay: StepOverlaySpec | undefined,
+  w: number,
+  h: number,
+  durationSec: number
+): string | null {
+  if (!stepOverlay) return null;
+  const font = resolveOverlayFont();
+  if (!font) return null;
+
+  const anim = (getSetting("STEP_OVERLAY_ANIMATION") || "slide-up").toLowerCase();
+  const enterSec = Math.max(0.01, parseFloat(getSetting("STEP_OVERLAY_ENTER_SEC") || "0.35"));
+  const exitSec = Math.max(0.01, parseFloat(getSetting("STEP_OVERLAY_EXIT_SEC") || "0.25"));
+
+  const f = (n: number) => n.toFixed(2);
+  const t0 = Math.max(0, stepOverlay.atSec ?? 0);
+  const duration = stepOverlay.duration ?? 2.0;
+  const t1 = t0 + duration;
+
+  // Font sizes:
+  // Line 1: STEP X (smaller, bold, ~60–75px)
+  // Line 2: TITLE (larger, bold, ~90–115px)
+  let fontSize1 = Math.round(68 * (h / 1080));
+  let fontSize2 = Math.round(100 * (h / 1080));
+
+  // Dynamically shrink title font size to fit within 85% of video width
+  const maxTextWidth = w * 0.85;
+  const text2 = sanitizeStepOverlayText(stepOverlay.title);
+  const estimatedTextWidth = text2.length * fontSize2 * 0.65;
+  if (estimatedTextWidth > maxTextWidth) {
+    const fittedSize = Math.round(maxTextWidth / (text2.length * 0.65));
+    fontSize2 = Math.min(fontSize2, fittedSize);
+  }
+
+  // Set lower bounds and upper bounds to keep them sane
+  fontSize1 = Math.max(40, Math.min(100, fontSize1));
+  fontSize2 = Math.max(60, Math.min(160, fontSize2));
+
+  const lineGap = 15;
+
+  let yExpr1 = "";
+  let yExpr2 = "";
+
+  if (anim === "slide-up") {
+    // Initial Y: h * 0.70
+    // Final Y: h * 0.50
+    yExpr1 = `if(lt(t,${f(t0 + enterSec)}),h*0.70-${fontSize1 + lineGap}-(h*0.20)*(t-${f(t0)})/${f(enterSec)},h*0.50-${fontSize1 + lineGap})`;
+    yExpr2 = `if(lt(t,${f(t0 + enterSec)}),h*0.70+${lineGap}-(h*0.20)*(t-${f(t0)})/${f(enterSec)},h*0.50+${lineGap})`;
+  } else {
+    yExpr1 = `h*0.50-${fontSize1 + lineGap}`;
+    yExpr2 = `h*0.50+${lineGap}`;
+  }
+
+  let alphaExpr = "";
+  if (anim === "fade") {
+    alphaExpr = `if(lt(t,${f(t0)}),0,if(lt(t,${f(t0 + enterSec)}),(t-${f(t0)})/${f(enterSec)},if(lt(t,${f(t1 - exitSec)}),1,if(lt(t,${f(t1)}),(${f(t1)}-t)/${f(exitSec)},0))))`;
+  } else if (anim === "slide-up") {
+    alphaExpr = `if(lt(t,${f(t0)}),0,if(lt(t,${f(t1 - exitSec)}),1,if(lt(t,${f(t1)}),(${f(t1)}-t)/${f(exitSec)},0)))`;
+  } else {
+    alphaExpr = `if(lt(t,${f(t0)}),0,if(lt(t,${f(t1)}),1,0))`;
+  }
+
+  const text1 = `STEP ${stepOverlay.stepNum}`;
+  const borderW1 = Math.max(4, Math.round(fontSize1 / 10));
+  const borderW2 = Math.max(4, Math.round(fontSize2 / 10));
+
+  const dt1 = `drawtext=fontfile='${escapeFilterPath(font)}'` +
+    `:text='${text1}':expansion=none` +
+    `:fontcolor=white:fontsize=${fontSize1}` +
+    `:borderw=${borderW1}:bordercolor=black@0.9` +
+    `:shadowx=3:shadowy=3:shadowcolor=black@0.6` +
+    `:x=(w-text_w)/2:y='${yExpr1}'` +
+    `:alpha='${alphaExpr}':enable='between(t,${f(t0)},${f(t1)})'`;
+
+  const dt2 = `drawtext=fontfile='${escapeFilterPath(font)}'` +
+    `:text='${text2}':expansion=none` +
+    `:fontcolor=white:fontsize=${fontSize2}` +
+    `:borderw=${borderW2}:bordercolor=black@0.9` +
+    `:shadowx=3:shadowy=3:shadowcolor=black@0.6` +
+    `:x=(w-text_w)/2:y='${yExpr2}'` +
+    `:alpha='${alphaExpr}':enable='between(t,${f(t0)},${f(t1)})'`;
+
+  return `${dt1},${dt2}`;
+}
+
 /**
  * Builds a `drawtext` filter that fades a big caption in and out — or null when
  * there's no usable font/text or the clip is too short to read. Times are LOCAL
@@ -304,6 +420,7 @@ function sanitizeOverlayText(s: string): string {
  */
 function buildOverlayDrawtext(
   overlay: OverlaySpec | undefined,
+  w: number,
   h: number,
   durationSec: number
 ): string | null {
@@ -318,10 +435,16 @@ function buildOverlayDrawtext(
   // least ~0.5s remains in the clip; the hold then shrinks to fit rather than
   // sliding the caption earlier — so it stays on the word even near a clip end.
   const t0 = Math.min(Math.max(0, overlay.atSec), Math.max(0, durationSec - 0.5));
-  const hold = Math.max(0.5, Math.min(1.8, durationSec - t0 - 0.05));
-  // Snappy pop-IN (near-instant) so the caption lands ON the word — a slow
-  // fade-in is what made it FEEL late even when the timing was correct. The
-  // fade-OUT stays gentle.
+  let hold = overlay.duration ?? Math.max(0.5, Math.min(1.8, durationSec - t0 - 0.05));
+  
+  // Clamp hold so it doesn't overshoot the clip duration
+  hold = Math.min(hold, durationSec - t0);
+  if (hold < 0.8) {
+    hold = Math.max(0.8, hold);
+    hold = Math.min(hold, durationSec);
+  }
+
+  // Snappy pop-IN (near-instant) so the caption lands ON the word
   const fadeIn = Math.min(0.08, hold / 4);
   const fadeOut = Math.min(0.3, hold / 3);
   const t1 = t0 + hold;
@@ -334,8 +457,29 @@ function buildOverlayDrawtext(
     `if(lt(t,${f(t1 - fadeOut)}),1,` +
     `if(lt(t,${f(t1)}),(${f(t1)}-t)/${f(fadeOut)},0))))`;
 
-  const fontSize = Math.max(28, Math.round(h / 10));
-  const borderW = Math.max(2, Math.round(fontSize / 16));
+  // Get font size settings
+  const pct = parseFloat(getSetting("CAPTION_FONT_SIZE_PERCENT") || "13");
+  let fontSize = Math.round((pct / 100) * h);
+  
+  // Proportional bounds based on 1080p standards: min 110px, max 180px
+  const minFontSize = Math.round(110 * (h / 1080));
+  const maxFontSize = Math.round(180 * (h / 1080));
+  fontSize = Math.max(minFontSize, Math.min(maxFontSize, fontSize));
+
+  // Reduce font size dynamically for longer texts to fit within 80% of video width
+  // Assumes character width ratio of roughly 0.65 for bold sans-serif font
+  const estimatedTextWidth = text.length * fontSize * 0.65;
+  if (estimatedTextWidth > w * 0.8) {
+    const fittedSize = Math.round((w * 0.8) / (text.length * 0.65));
+    fontSize = Math.min(fontSize, fittedSize);
+  }
+
+  // Keep a strong border/stroke width
+  const borderW = Math.max(4, Math.round(fontSize / 12));
+
+  // Vertical position
+  const posY = parseFloat(getSetting("CAPTION_POSITION_Y_PERCENT") || "72");
+  const yCoord = `h*${(posY / 100).toFixed(2)}`;
 
   return (
     `drawtext=fontfile='${escapeFilterPath(font)}'` +
@@ -344,8 +488,8 @@ function buildOverlayDrawtext(
     `:text='${text}':expansion=none` +
     `:fontcolor=white:fontsize=${fontSize}` +
     `:borderw=${borderW}:bordercolor=black@0.9` +
-    `:shadowx=2:shadowy=2:shadowcolor=black@0.5` +
-    `:x=(w-text_w)/2:y=h*0.74` +
+    `:shadowx=3:shadowy=3:shadowcolor=black@0.6` +
+    `:x=(w-text_w)/2:y=${yCoord}` +
     `:alpha='${alpha}':enable='between(t,${f(t0)},${f(t1)})'`
   );
 }
@@ -354,93 +498,21 @@ function buildOverlayDrawtext(
 function withOverlay(
   videoFilter: string,
   overlay: OverlaySpec | undefined,
+  stepOverlay: StepOverlaySpec | undefined,
+  w: number,
   h: number,
   durationSec: number
 ): string {
-  const dt = buildOverlayDrawtext(overlay, h, durationSec);
-  return dt ? `${videoFilter},${dt}` : videoFilter;
-}
-
-/** A caption + the ABSOLUTE time (s, on the final timeline) it should appear. */
-export interface TimedOverlay {
-  text: string;
-  atSec: number;
-}
-
-/** drawtext for ONE caption at an ABSOLUTE timeline position (final-pass burn).
- *  Fixed ~2s readable hold, snappy pop-in, gentle fade-out. null if unusable. */
-function absoluteOverlayDrawtext(text: string, atSec: number, h: number): string | null {
-  const t = sanitizeOverlayText(text);
-  if (!t) return null;
-  const font = resolveOverlayFont();
-  if (!font) return null;
-
-  const lead = 0.12; // start a touch before the word (Whisper marks starts late)
-  const t0 = Math.max(0, atSec - lead);
-  const SHOW = 2.0; // guaranteed readable on-screen time
-  const t1 = t0 + SHOW;
-  const fadeIn = 0.1;
-  const fadeOut = 0.4;
-  const f = (n: number) => n.toFixed(2);
-
-  const alpha =
-    `if(lt(t,${f(t0)}),0,` +
-    `if(lt(t,${f(t0 + fadeIn)}),(t-${f(t0)})/${f(fadeIn)},` +
-    `if(lt(t,${f(t1 - fadeOut)}),1,` +
-    `if(lt(t,${f(t1)}),(${f(t1)}-t)/${f(fadeOut)},0))))`;
-
-  const fontSize = Math.max(28, Math.round(h / 10));
-  const borderW = Math.max(2, Math.round(fontSize / 16));
-  return (
-    `drawtext=fontfile='${escapeFilterPath(font)}'` +
-    `:text='${t}':expansion=none` +
-    `:fontcolor=white:fontsize=${fontSize}` +
-    `:borderw=${borderW}:bordercolor=black@0.9` +
-    `:shadowx=2:shadowy=2:shadowcolor=black@0.5` +
-    `:x=(w-text_w)/2:y=h*0.74` +
-    `:alpha='${alpha}':enable='between(t,${f(t0)},${f(t1)})'`
-  );
-}
-
-/**
- * Burns hook captions onto a finished video in ONE pass at ABSOLUTE timeline
- * positions. Each lands exactly when its word is spoken and stays up a full
- * readable ~2s — independent of clip boundaries or per-clip duration drift (the
- * old per-clip baking made captions flash for a few frames and slide early).
- * Audio is stream-copied. If there's no usable font/caption the input is copied
- * through unchanged — captions never block or fail a render.
- */
-export async function burnOverlays(
-  inPath: string,
-  outPath: string,
-  overlays: TimedOverlay[],
-  h: number
-): Promise<void> {
-  ensureFfmpegPaths();
-  const filters = overlays
-    .map((o) => absoluteOverlayDrawtext(o.text, o.atSec, h))
-    .filter((x): x is string => !!x);
-  if (filters.length === 0) {
-    fs.copyFileSync(inPath, outPath);
-    return;
+  let filter = videoFilter;
+  if (stepOverlay) {
+    const dt = buildStepOverlayDrawtext(stepOverlay, w, h, durationSec);
+    if (dt) filter = `${filter},${dt}`;
   }
-  const vf = filters.join(",");
-  await new Promise<void>((resolve, reject) => {
-    ffmpeg()
-      .input(inPath)
-      .videoFilters(vf)
-      .outputOptions([
-        "-c:v libx264",
-        "-preset veryfast",
-        "-crf 20",
-        "-pix_fmt yuv420p",
-        "-c:a copy",
-        "-movflags +faststart",
-      ])
-      .on("error", reject)
-      .on("end", () => resolve())
-      .save(outPath);
-  });
+  if (overlay) {
+    const dt = buildOverlayDrawtext(overlay, w, h, durationSec);
+    if (dt) filter = `${filter},${dt}`;
+  }
+  return filter;
 }
 
 /**
@@ -456,7 +528,8 @@ function renderKenBurnsClip(
   durationSec: number,
   direction: "in" | "out",
   tailSilenceSec: number = 0,
-  overlay?: OverlaySpec
+  overlay?: OverlaySpec,
+  stepOverlay?: StepOverlaySpec
 ): Promise<void> {
   const totalFrames = Math.max(2, Math.ceil(durationSec * fps));
   const minZoom = 1.0;
@@ -500,7 +573,7 @@ function renderKenBurnsClip(
       .input(imagePath)
       .inputOptions(["-loop 1"])
       .input(audioPath)
-      .videoFilters(withOverlay(filter, overlay, h, durationSec));
+      .videoFilters(withOverlay(filter, overlay, stepOverlay, w, h, durationSec));
     if (tailSilenceSec > 0) {
       cmd.audioFilters(`apad=pad_dur=${tailSilenceSec.toFixed(3)}`);
     }
@@ -535,7 +608,8 @@ async function renderAnimatedClip(
   fps: number,
   durationSec: number,
   tailSilenceSec: number = 0,
-  overlay?: OverlaySpec
+  overlay?: OverlaySpec,
+  stepOverlay?: StepOverlaySpec
 ): Promise<void> {
   const videoDur = await probeDuration(videoPath);
 
@@ -552,7 +626,7 @@ async function renderAnimatedClip(
       videoFilter = `${videoFilter},tpad=stop_mode=clone:stop_duration=${freezeNeeded.toFixed(3)}`;
     }
   }
-  videoFilter = withOverlay(videoFilter, overlay, h, durationSec);
+  videoFilter = withOverlay(videoFilter, overlay, stepOverlay, w, h, durationSec);
 
   return new Promise((resolve, reject) => {
     const cmd = ffmpeg()
@@ -797,7 +871,12 @@ export interface SingleShotInput {
   endMs: number;
   /** Optional big fading caption burned into this clip. */
   overlay?: OverlaySpec;
+  /** Optional step overlay. */
+  stepOverlay?: StepOverlaySpec;
+  fileStem?: string;
+  dedupeId?: string;
 }
+
 
 /**
  * Assemble the final video in single-shot voiceover mode.
@@ -824,8 +903,7 @@ export async function assembleSingleShot(
   runId: string,
   inputs: SingleShotInput[],
   globalAudioPath: string,
-  outDir: string,
-  overlays: TimedOverlay[] = []
+  outDir: string
 ): Promise<string> {
   ensureFfmpegPaths();
 
@@ -858,9 +936,9 @@ export async function assembleSingleShot(
         const durationSec = Math.max(0.1, (item.endMs - item.startMs) / 1000);
         if (item.kind === "photo") {
           const zoomDirection: "in" | "out" = Math.random() < 0.5 ? "in" : "out";
-          await renderSilentKenBurns(item.assetPath, clipPath, w, h, fps, durationSec, zoomDirection, item.overlay);
+          await renderSilentKenBurns(item.assetPath, clipPath, w, h, fps, durationSec, zoomDirection, item.overlay, item.stepOverlay);
         } else {
-          await renderSilentVideo(item.assetPath, clipPath, w, h, fps, durationSec, item.overlay);
+          await renderSilentVideo(item.assetPath, clipPath, w, h, fps, durationSec, item.overlay, item.stepOverlay);
         }
         log(
           runId,
@@ -884,24 +962,6 @@ export async function assembleSingleShot(
   // 3. Mux the global voiceover onto the silent concat.
   const finalPath = path.join(outDir, "final.mp4");
   await muxAudioOntoVideo(silentConcat, globalAudioPath, finalPath);
-
-  // 3b. Burn hook captions in ONE final pass at absolute timeline positions
-  //     (exact timing + guaranteed readable hold; never baked into clips).
-  if (overlays.length > 0) {
-    const withText = path.join(outDir, "final_text.mp4");
-    try {
-      await burnOverlays(finalPath, withText, overlays, h);
-      fs.rmSync(finalPath, { force: true });
-      fs.renameSync(withText, finalPath);
-      log(runId, "info", `Burned ${overlays.length} text caption(s) onto the final video`, { stage: "assemble" });
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      log(runId, "warn", `Text caption burn failed (video kept without captions): ${msg.slice(0, 150)}`, {
-        stage: "assemble",
-      });
-      try { fs.rmSync(withText, { force: true }); } catch {}
-    }
-  }
   log(runId, "success", `Final video: ${finalPath}`, { stage: "assemble" });
 
   // 4. Clean up the intermediate silent concat.
@@ -925,7 +985,8 @@ async function renderSilentVideo(
   h: number,
   fps: number,
   durationSec: number,
-  overlay?: OverlaySpec
+  overlay?: OverlaySpec,
+  stepOverlay?: StepOverlaySpec
 ): Promise<void> {
   const videoDur = await probeDuration(videoPath);
 
@@ -946,7 +1007,7 @@ async function renderSilentVideo(
   return new Promise((resolve, reject) => {
     ffmpeg()
       .input(videoPath)
-      .videoFilters(withOverlay(videoFilter, overlay, h, durationSec))
+      .videoFilters(withOverlay(videoFilter, overlay, stepOverlay, w, h, durationSec))
       .outputOptions([
         "-an", // drop any audio from the Pexels clip — audio is muxed globally
         `-r ${fps}`,
@@ -976,7 +1037,8 @@ function renderSilentKenBurns(
   fps: number,
   durationSec: number,
   direction: "in" | "out",
-  overlay?: OverlaySpec
+  overlay?: OverlaySpec,
+  stepOverlay?: StepOverlaySpec
 ): Promise<void> {
   const totalFrames = Math.max(2, Math.ceil(durationSec * fps));
   const minZoom = 1.0;
@@ -1019,7 +1081,7 @@ function renderSilentKenBurns(
     ffmpeg()
       .input(imagePath)
       .inputOptions(["-loop 1"])
-      .videoFilters(withOverlay(filter, overlay, h, durationSec))
+      .videoFilters(withOverlay(filter, overlay, stepOverlay, w, h, durationSec))
       .outputOptions([
         "-an", // silent — audio is muxed globally afterwards
         `-r ${fps}`,

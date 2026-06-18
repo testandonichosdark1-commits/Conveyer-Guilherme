@@ -36,6 +36,8 @@ export interface SingleShotAudio {
   durationSec: number;
   /** [startMs, endMs] of each scene's words inside `filePath`. */
   ranges: SceneAudioRange[];
+  /** The full Whisper transcript words with timestamps. */
+  transcript?: TranscriptWord[];
 }
 
 /**
@@ -131,7 +133,7 @@ export async function synthesizeAndAlign(
     { stage: "tts_align" }
   );
 
-  return { filePath: audioPath, durationSec: audioDurationSec, ranges };
+  return { filePath: audioPath, durationSec: audioDurationSec, ranges, transcript };
 }
 
 /**
@@ -170,7 +172,7 @@ export async function alignToExistingAudio(
     `Re-align: ${aligned}/${scenes.length} scenes mapped to audio ranges`,
     { stage: "tts_align" }
   );
-  return { filePath: audioPath, durationSec: audioDurationSec, ranges };
+  return { filePath: audioPath, durationSec: audioDurationSec, ranges, transcript };
 }
 
 /**

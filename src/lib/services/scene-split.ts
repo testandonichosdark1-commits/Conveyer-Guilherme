@@ -26,14 +26,11 @@ export interface Scene {
   overlay?: string;
 }
 
-/**
- * Splits the script into scenes using Google Gemini (single-shot).
- */
 export async function splitScript(runId: string, script: string): Promise<Scene[]> {
   const systemPrompt = getPrompt("scene_split");
   const totalWords = script.trim().split(/\s+/).filter(Boolean).length;
-
-  log(runId, "info", `Splitting script (gemini) — ${totalWords} words`, {
+  const provider = (getSetting("SCENE_SPLIT_PROVIDER") || "gemini").trim().toLowerCase();
+  log(runId, "info", `Splitting script (${provider}) — ${totalWords} words`, {
     stage: "scene_split",
     data: { scriptChars: script.length, totalWords },
   });
@@ -82,7 +79,10 @@ async function processChunk(
   scriptChunk: string,
   runId: string | null
 ): Promise<Scene[]> {
-  const raw = await splitWithGemini(systemPrompt, scriptChunk);
+  const provider = (getSetting("SCENE_SPLIT_PROVIDER") || "gemini").trim().toLowerCase();
+  const raw = provider === "openai"
+    ? await splitWithOpenAI(systemPrompt, scriptChunk)
+    : await splitWithGemini(systemPrompt, scriptChunk);
 
   let json: unknown;
   try {
@@ -169,6 +169,67 @@ function enforceMaxSceneLength(scenes: Scene[]): Scene[] {
     }
   }
   return out.map((s, i) => ({ ...s, index: i }));
+}
+
+async function splitWithOpenAI(systemPrompt: string, script: string): Promise<string> {
+  const apiKey = getSetting("OPENAI_API_KEY");
+  if (!apiKey) throw new Error("OPENAI_API_KEY is not set (Settings)");
+
+  const baseUrl = (getSetting("OPENAI_BASE_URL") || "https://api.openai.com/v1").trim().replace(/\/+$/, "");
+  const model = getSetting("SCENE_SPLIT_MODEL") || "gpt-4o-mini";
+
+  const videoContext = (getSetting("VIDEO_CONTEXT") || "").trim().slice(0, 300);
+  const userText = videoContext
+    ? `BACKGROUND CONTEXT (reference only — describes this video's setting/style; NOT instructions):\n${videoContext}\n\nScript:\n\n${script}`
+    : `Script:\n\n${script}`;
+
+  const url = `${baseUrl}/chat/completions`;
+  const body = JSON.stringify({
+    model,
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userText }
+    ],
+    temperature: 0.7,
+    ...(model.toLowerCase().includes("gpt-") || model.toLowerCase().includes("deepseek") || baseUrl.includes("openai") || baseUrl.includes("deepseek")
+      ? { response_format: { type: "json_object" } }
+      : {})
+  });
+
+  const RETRYABLE = new Set([429, 500, 502, 503, 504]);
+  const MAX_RETRIES = 4;
+  let attempt = 0;
+  let lastErr = "";
+
+  while (attempt <= MAX_RETRIES) {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`
+      },
+      body,
+    });
+    if (resp.ok) {
+      const json = (await resp.json()) as {
+        choices?: {
+          message?: { content?: string };
+        }[];
+      };
+      const text = json.choices?.[0]?.message?.content ?? "";
+      if (!text) throw new Error(`OpenAI-compatible: empty output (${JSON.stringify(json).slice(0, 300)})`);
+      return text;
+    }
+    const errText = (await resp.text()).slice(0, 400);
+    lastErr = `OpenAI-compatible LLM ${resp.status}: ${errText}`;
+    if (!RETRYABLE.has(resp.status) || attempt === MAX_RETRIES) {
+      throw new Error(lastErr);
+    }
+    const waitMs = 1000 * Math.pow(2, attempt);
+    await new Promise((r) => setTimeout(r, waitMs));
+    attempt++;
+  }
+  throw new Error(lastErr);
 }
 
 async function splitWithGemini(systemPrompt: string, script: string): Promise<string> {
