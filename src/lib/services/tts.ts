@@ -27,8 +27,6 @@ export type ResolvedTtsProvider =
   | "minimax-ai33pro"
   | "edge-ai33pro";
 
-let edgeV3UnauthorizedThisProcess = false;
-
 /**
  * The voice engine that will ACTUALLY be used for this run.
  *
@@ -36,8 +34,9 @@ let edgeV3UnauthorizedThisProcess = false;
  *   TTS_PROVIDER=edge-ai33pro
  *   TTS_VOICE_ID=en-US-GuyNeural, en-US-AriaNeural, etc.
  *
- * Edge voices use AI33PRO_API_KEY. We try ai33.pro V3 first when available;
- * if the key is not authorized for V3, we fall back to the V1 ai33.pro path.
+ * Edge voices use AI33PRO_API_KEY through the ai33.pro V3 API.
+ * Do NOT fall back to V1 for Edge: the V1 endpoint is ElevenLabs-oriented and
+ * appears as ElevenLabs in the ai33.pro dashboard.
  */
 export function resolveTtsProvider(): ResolvedTtsProvider {
   const selected = (getSetting("TTS_PROVIDER") || "ai33pro").trim().toLowerCase();
@@ -192,42 +191,21 @@ async function edgeAi33proTts(runId: string, text: string, outPath: string): Pro
   const voiceId = resolveEdgeAi33proVoiceId(getSetting("TTS_VOICE_ID") || "");
   const speed = readSpeed(0.5, 1.5, 1);
 
-  if (!edgeV3UnauthorizedThisProcess) {
-    try {
-      const taskId = await createV3SpeechTask(text, { voiceId, speed, withTranscript: false });
-      log(runId, "debug", `Edge (ai33pro V3) TTS task ${taskId.slice(0, 8)}… (${voiceId}, speed=${speed})`, { stage: "tts" });
-      const task = await pollV3Task(taskId, runId, "tts");
-      await downloadV3Task(task, outPath);
-      return;
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      if (!isUnauthorizedError(msg)) {
-        throw new Error(`${msg} — check the Edge voice "${voiceId}" is valid for this ai33.pro account.`);
-      }
-      edgeV3UnauthorizedThisProcess = true;
-      log(runId, "warn", "ai33.pro V3 is unauthorized for this key; falling back to the V1 Edge TTS path", { stage: "tts" });
-    }
-  }
-
-  await edgeAi33proV1FallbackTts(runId, text, outPath, voiceId);
-}
-
-async function edgeAi33proV1FallbackTts(runId: string, text: string, outPath: string, voiceId: string): Promise<void> {
-  const explicitModel = (getSetting("TTS_MODEL") || "").trim();
-  const modelId = explicitModel && !/^eleven_/i.test(explicitModel) ? explicitModel : "edge";
-
-  const taskId = await createTtsTask(text, { voiceId, modelId });
-  log(runId, "debug", `Edge (ai33pro V1 fallback) TTS task ${taskId.slice(0, 8)}… (${modelId} / ${voiceId})`, { stage: "tts" });
-
-  let task;
   try {
-    task = await pollTask(taskId, runId, "tts");
+    const taskId = await createV3SpeechTask(text, { voiceId, speed, withTranscript: false });
+    log(runId, "debug", `Edge (ai33pro V3) TTS task ${taskId.slice(0, 8)}… (${voiceId}, speed=${speed})`, { stage: "tts" });
+    const task = await pollV3Task(taskId, runId, "tts");
+    await downloadV3Task(task, outPath);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    throw new Error(`${msg} — V3 is unauthorized and V1 fallback also failed. Check whether ai33.pro supports Edge voices for your API key.`);
+    if (isUnauthorizedError(msg)) {
+      throw new Error(
+        `${msg} — Edge via ai33.pro requires access to the ai33.pro V3 API for this API key. ` +
+        `I did not fall back to V1 because V1 is routed as ElevenLabs in the ai33.pro dashboard.`
+      );
+    }
+    throw new Error(`${msg} — check the Edge voice "${voiceId}" is valid for this ai33.pro account.`);
   }
-  await downloadTask(task, outPath);
-  await maybeApplyTempo(runId, outPath, "Edge ai33pro V1 fallback / atempo");
 }
 
 function isUnauthorizedError(msg: string): boolean {
