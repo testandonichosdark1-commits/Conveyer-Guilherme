@@ -7,25 +7,20 @@ import { log, type LogLevel } from "../logger";
  *
  * Docs: https://ai33.pro/app/api-document (ElevenLabs + Common tabs)
  *
- * Flow is async:
+ * V1 flow is async:
  *   1. POST /v1/text-to-speech/{voice_id} → { success, task_id, ec_remain_credits }
  *   2. Poll  GET /v1/task/{task_id} until status === "done"
- *      Status values: "doing" (still working) | "done" (ready) | "error" (failed)
- *   3. Download the audio from `metadata.audio_url` in the done-task response
+ *   3. Download the audio from metadata.audio_url
  *
- * Auth: header  `xi-api-key: $AI33PRO_API_KEY`  (ElevenLabs-compatible).
+ * V1 auth: xi-api-key.
  */
 
 const BASE = "https://api.ai33.pro/v1";
 const POLL_INTERVAL_MS = 2500;
 const POLL_MAX_MS = 15 * 60 * 1000;
-
-// Single fetch timeout. Bumped from 60s after observing legit ai33pro responses
-// taking 30-90s under load (especially on POST). 120s gives reasonable headroom.
 const DEFAULT_TIMEOUT_MS = 120_000;
 const DOWNLOAD_TIMEOUT_MS = 5 * 60_000;
 
-/** Status values per ai33pro docs (Common / GET Task). */
 type TaskStatus = "doing" | "done" | "error" | string;
 
 function getKey(): string {
@@ -55,38 +50,28 @@ async function fetchWithTimeout(
   }
 }
 
-// ── POST: create a TTS task ─────────────────────────────────────────────────
+// ── V1 ElevenLabs-compatible TTS ─────────────────────────────────────────────
 
 interface CreateTtsTaskResponse {
   success?: boolean;
   task_id?: string;
   ec_remain_credits?: number;
-  /** Some proxies put an error message at the top level on failure. */
   error?: string;
   message?: string;
 }
 
 export interface CreateTtsOptions {
-  /** ElevenLabs voice id (path param). */
   voiceId: string;
-  /** ElevenLabs model id. Default: eleven_multilingual_v2. */
   modelId?: string;
-  /** Output format query param. Default: mp3_44100_128. */
   outputFormat?: string;
-  /** Optional webhook URL — when set, ai33pro POSTs the result there instead of (or in addition to) polling. */
   receiveUrl?: string;
 }
 
-/**
- * Creates a TTS task. Returns the task_id ai33pro assigned.
- * Retries once on transient errors (network abort, 5xx).
- */
 export async function createTtsTask(text: string, opts: CreateTtsOptions): Promise<string> {
   if (!opts.voiceId) throw new Error("ai33pro createTtsTask: voiceId is required");
 
   const outputFormat = opts.outputFormat || "mp3_44100_128";
   const url = `${BASE}/text-to-speech/${encodeURIComponent(opts.voiceId)}?output_format=${encodeURIComponent(outputFormat)}`;
-
   const body: Record<string, unknown> = {
     text,
     model_id: opts.modelId || "eleven_multilingual_v2",
@@ -106,10 +91,7 @@ export async function createTtsTask(text: string, opts: CreateTtsOptions): Promi
       });
       if (!resp.ok) {
         const txt = (await resp.text()).slice(0, 400);
-        // 4xx errors aren't retryable (bad input). 5xx might be.
-        if (resp.status < 500) {
-          throw new Error(`ai33pro POST /text-to-speech HTTP ${resp.status}: ${txt}`);
-        }
+        if (resp.status < 500) throw new Error(`ai33pro POST /text-to-speech HTTP ${resp.status}: ${txt}`);
         lastErr = new Error(`ai33pro POST /text-to-speech HTTP ${resp.status}: ${txt}`);
       } else {
         const json = (await resp.json()) as CreateTtsTaskResponse;
@@ -121,33 +103,24 @@ export async function createTtsTask(text: string, opts: CreateTtsOptions): Promi
       }
     } catch (e) {
       lastErr = e;
-      // Don't retry on AbortError unless we have attempts left — but DO retry
-      // network errors (ECONNRESET, fetch failed, etc.) since they're transient.
     }
     if (attempt < MAX_ATTEMPTS) await sleep(2000);
   }
   throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
 }
 
-// ── GET: poll a task until it finishes ──────────────────────────────────────
-
-/**
- * GET Task response shape, per ai33pro docs.
- * The audio file URL lives inside `metadata.audio_url`.
- */
 export interface TaskInfo {
   id: string;
   created_at: string;
   status: TaskStatus;
   error_message?: string | null;
   credit_cost?: number;
-  progress?: number; // 0-100
-  type?: string; // e.g. "tts"
+  progress?: number;
+  type?: string;
   metadata?: {
     audio_url?: string;
     srt_url?: string;
     json_url?: string;
-    /** Some task types use this instead (sound-effect, voice-isolate). */
     output_uri?: string;
     [k: string]: unknown;
   };
@@ -164,7 +137,6 @@ export async function getTask(taskId: string): Promise<TaskInfo> {
   return (await resp.json()) as TaskInfo;
 }
 
-/** Picks the audio URL out of a "done" task. Per docs: `metadata.audio_url` for TTS. */
 function resolveAudioUrl(task: TaskInfo): string | null {
   return task.metadata?.audio_url || task.metadata?.output_uri || null;
 }
@@ -197,13 +169,10 @@ export async function pollTask(taskId: string, runId: string, stage: string = "t
     if (task.status === "error") {
       throw new Error(`ai33pro task ${taskId} error: ${task.error_message || "no error message"}`);
     }
-    // Anything else (e.g. "doing") → keep polling.
 
     await sleep(POLL_INTERVAL_MS);
   }
 }
-
-// ── Download finished audio to disk ─────────────────────────────────────────
 
 export async function downloadTask(task: TaskInfo, outPath: string): Promise<void> {
   const audioUrl = resolveAudioUrl(task);
@@ -214,7 +183,6 @@ export async function downloadTask(task: TaskInfo, outPath: string): Promise<voi
     );
   }
 
-  // The signed download URL doesn't need the API key — it's an https file URL.
   const resp = await fetchWithTimeout(audioUrl, undefined, DOWNLOAD_TIMEOUT_MS);
   if (!resp.ok) {
     const txt = (await resp.text()).slice(0, 200);
@@ -226,64 +194,90 @@ export async function downloadTask(task: TaskInfo, outPath: string): Promise<voi
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// V3 unified API (ElevenLabs / Minimax / Edge / Kokoro) — used for Kokoro TTS.
+// V3 unified API (ElevenLabs / Minimax / Edge / Kokoro).
 //
-// Different from the V1 calls above:
-//   • Base https://api.ai33.pro/v3   (V1 was /v1)
-//   • Auth header  `Authorization: <key>`   (V1 used `xi-api-key`)
-//   • Body is multipart FormData      (V1 was JSON) — Content-Type MUST stay
-//     unset so the runtime adds the multipart boundary.
-//   • voice_id carries a provider PREFIX, e.g. `kokoro_af_heart`.
-//   • The task JSON is nested under `data` (status + metadata.audio_url).
-//
-// Flow (async, same idea as V1):
-//   1. POST /v3/text-to-speech (FormData) → { success, task_id }
-//   2. GET  /v3/task/:task_id until data.status === "done"
-//   3. download data.metadata.audio_url
+// ai33.pro V3 deployments have used different auth header names over time.
+// To avoid false 401s, we try the known variants and remember the one that works.
 // ════════════════════════════════════════════════════════════════════════════
 
 const V3_BASE = "https://api.ai33.pro/v3";
 
-/** V3 auth: raw key in `Authorization` (NO "Bearer"). No Content-Type — FormData
- *  sets its own multipart boundary. */
-function authHeadersV3(): Record<string, string> {
-  return { Authorization: getKey() };
+interface V3AuthVariant {
+  name: string;
+  headers: Record<string, string>;
+}
+
+let workingV3AuthName: string | null = null;
+
+function v3AuthHeaderVariants(): V3AuthVariant[] {
+  const key = getKey();
+  return [
+    { name: "Authorization", headers: { Authorization: key } },
+    { name: "Authorization Bearer", headers: { Authorization: `Bearer ${key}` } },
+    { name: "xi-api-key", headers: { "xi-api-key": key } },
+    { name: "x-api-key", headers: { "x-api-key": key } },
+  ];
+}
+
+async function fetchV3WithAuth(
+  url: string,
+  initFactory: (headers: Record<string, string>) => RequestInit,
+  context: string
+): Promise<Response> {
+  const variants = v3AuthHeaderVariants();
+  const ordered = workingV3AuthName
+    ? [
+        ...variants.filter((v) => v.name === workingV3AuthName),
+        ...variants.filter((v) => v.name !== workingV3AuthName),
+      ]
+    : variants;
+
+  let lastAuthError = "";
+  for (const variant of ordered) {
+    const resp = await fetchWithTimeout(url, initFactory(variant.headers));
+    if (resp.status === 401 || resp.status === 403) {
+      const txt = (await resp.text()).slice(0, 400);
+      lastAuthError = `${context} via ${variant.name} HTTP ${resp.status}: ${txt}`;
+      continue;
+    }
+    if (resp.ok) workingV3AuthName = variant.name;
+    return resp;
+  }
+
+  throw new Error(`${context} unauthorized with all supported auth headers. Last error: ${lastAuthError}`);
 }
 
 export interface CreateV3SpeechOptions {
-  /** Prefixed voice id, e.g. "kokoro_af_heart". */
   voiceId: string;
-  /** 0.5–1.5. Native speed (no ffmpeg post-process needed). */
   speed?: number;
   withTranscript?: boolean;
 }
 
-/** Creates a V3 text-to-speech task. Returns the task_id. Retries once on 5xx/network. */
 export async function createV3SpeechTask(text: string, opts: CreateV3SpeechOptions): Promise<string> {
   if (!opts.voiceId) throw new Error("ai33pro V3 createV3SpeechTask: voiceId is required");
 
   const url = `${V3_BASE}/text-to-speech`;
   const MAX_ATTEMPTS = 2;
   let lastErr: unknown;
+
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
-      // Fresh FormData per attempt (a body can't be reused across fetches).
-      const form = new FormData();
-      form.append("text", text);
-      form.append("voice_id", opts.voiceId);
-      if (opts.speed != null && Number.isFinite(opts.speed)) form.append("speed", String(opts.speed));
-      form.append("with_transcript", String(opts.withTranscript ?? false));
+      const resp = await fetchV3WithAuth(
+        url,
+        (headers) => {
+          const form = new FormData();
+          form.append("text", text);
+          form.append("voice_id", opts.voiceId);
+          if (opts.speed != null && Number.isFinite(opts.speed)) form.append("speed", String(opts.speed));
+          form.append("with_transcript", String(opts.withTranscript ?? false));
+          return { method: "POST", headers, body: form };
+        },
+        "ai33pro V3 POST /text-to-speech"
+      );
 
-      const resp = await fetchWithTimeout(url, {
-        method: "POST",
-        headers: authHeadersV3(),
-        body: form,
-      });
       if (!resp.ok) {
         const txt = (await resp.text()).slice(0, 400);
-        if (resp.status < 500) {
-          throw new Error(`ai33pro V3 POST /text-to-speech HTTP ${resp.status}: ${txt}`);
-        }
+        if (resp.status < 500) throw new Error(`ai33pro V3 POST /text-to-speech HTTP ${resp.status}: ${txt}`);
         lastErr = new Error(`ai33pro V3 POST /text-to-speech HTTP ${resp.status}: ${txt}`);
       } else {
         const json = (await resp.json()) as {
@@ -303,10 +297,10 @@ export async function createV3SpeechTask(text: string, opts: CreateV3SpeechOptio
     }
     if (attempt < MAX_ATTEMPTS) await sleep(2000);
   }
+
   throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
 }
 
-/** V3 task shape (the useful subset). The audio lives at metadata.audio_url. */
 export interface V3TaskInfo {
   id: string;
   type?: string;
@@ -320,7 +314,11 @@ export interface V3TaskInfo {
 
 export async function getV3Task(taskId: string): Promise<V3TaskInfo> {
   const url = `${V3_BASE}/task/${encodeURIComponent(taskId)}`;
-  const resp = await fetchWithTimeout(url, { headers: authHeadersV3() });
+  const resp = await fetchV3WithAuth(
+    url,
+    (headers) => ({ headers }),
+    "ai33pro V3 GET task"
+  );
   if (!resp.ok) {
     const txt = (await resp.text()).slice(0, 300);
     throw new Error(`ai33pro V3 GET task HTTP ${resp.status}: ${txt}`);
@@ -379,8 +377,6 @@ export async function downloadV3Task(task: V3TaskInfo, outPath: string): Promise
   fs.writeFileSync(outPath, buf);
 }
 
-// ── helpers ─────────────────────────────────────────────────────────────────
-
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -401,7 +397,6 @@ export async function createMinimaxAi33proTask(text: string, opts: CreateMinimax
   if (!opts.voiceId) throw new Error("ai33pro createMinimaxAi33proTask: voiceId is required");
 
   const url = `${V1M_BASE}/task/text-to-speech`;
-
   const body = JSON.stringify({
     text,
     model: opts.model || "speech-02-hd",
@@ -426,9 +421,7 @@ export async function createMinimaxAi33proTask(text: string, opts: CreateMinimax
       });
       if (!resp.ok) {
         const txt = (await resp.text()).slice(0, 400);
-        if (resp.status < 500) {
-          throw new Error(`ai33pro POST /v1m/task/text-to-speech HTTP ${resp.status}: ${txt}`);
-        }
+        if (resp.status < 500) throw new Error(`ai33pro POST /v1m/task/text-to-speech HTTP ${resp.status}: ${txt}`);
         lastErr = new Error(`ai33pro POST /v1m/task/text-to-speech HTTP ${resp.status}: ${txt}`);
       } else {
         const json = (await resp.json()) as {
