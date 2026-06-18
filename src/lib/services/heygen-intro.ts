@@ -10,7 +10,9 @@ export interface HeyGenIntroAssembleResult {
   outputPath: string;
   heygenVideoPath: string;
   introAudioPath: string;
+  requestedSeconds: number;
   seconds: number;
+  cutReason: string;
   videoId: string;
   cached: boolean;
   duration?: number;
@@ -23,13 +25,14 @@ function videoSize(): { w: number; h: number } {
   return { w, h };
 }
 
-function runFfmpeg(args: string[], label: string): void {
+function runFfmpeg(args: string[], label: string): string {
   const bin = resolveFfmpegBinary();
   const result = spawnSync(bin, args, { stdio: "pipe" });
+  const stderr = result.stderr?.toString() || "";
   if (result.status !== 0) {
-    const stderr = result.stderr?.toString().slice(-1200) || "";
-    throw new Error(`${label} failed with ffmpeg rc=${result.status}: ${stderr}`);
+    throw new Error(`${label} failed with ffmpeg rc=${result.status}: ${stderr.slice(-1200)}`);
   }
+  return stderr;
 }
 
 function normalizeSegment(srcPath: string, outPath: string, opts: { trimStartSec?: number; seconds?: number }): void {
@@ -90,15 +93,59 @@ function concatClips(firstPath: string, secondPath: string, outPath: string): vo
   ], "Concat HeyGen intro");
 }
 
+function detectNextSilenceCut(srcPath: string, minSeconds: number): { seconds: number; reason: string } {
+  const maxExtraSeconds = 8;
+  const maxSeconds = Math.min(60, minSeconds + maxExtraSeconds);
+  const scanDuration = Math.max(2, maxSeconds + 1);
+
+  try {
+    const stderr = runFfmpeg([
+      "-hide_banner",
+      "-nostats",
+      "-i", srcPath,
+      "-t", scanDuration.toFixed(3),
+      "-af", "silencedetect=n=-35dB:d=0.22",
+      "-f", "null",
+      "-",
+    ], "Detect intro silence");
+
+    const candidates: number[] = [];
+    const re = /silence_start:\s*([0-9.]+)/g;
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(stderr))) {
+      const t = Number(match[1]);
+      if (Number.isFinite(t) && t >= minSeconds && t <= maxSeconds) {
+        candidates.push(t);
+      }
+    }
+
+    if (candidates.length > 0) {
+      const chosen = Math.max(minSeconds, candidates[0]);
+      return { seconds: round3(chosen), reason: `next silence after ${minSeconds}s` };
+    }
+  } catch {
+    // If silence detection fails, keep the original requested cut.
+  }
+
+  return { seconds: round3(minSeconds), reason: "requested seconds; no silence found nearby" };
+}
+
+function round3(n: number): number {
+  return Math.round(n * 1000) / 1000;
+}
+
 export async function applyHeyGenIntroToFinalVideoSafe(finalVideoPath: string, seconds = 10): Promise<HeyGenIntroAssembleResult> {
   if (!fs.existsSync(finalVideoPath)) throw new Error(`Final video not found: ${finalVideoPath}`);
 
-  const introSeconds = Math.max(1, Math.min(60, seconds));
+  const requestedSeconds = Math.max(1, Math.min(60, seconds));
+  const cut = detectNextSilenceCut(finalVideoPath, requestedSeconds);
+  const introSeconds = cut.seconds;
+
   const runDir = path.dirname(finalVideoPath);
   const workDir = path.join(runDir, "heygen_intro");
   fs.mkdirSync(workDir, { recursive: true });
 
-  const introAudioPath = path.join(workDir, `intro_${introSeconds.toFixed(0)}s.mp3`);
+  const introAudioPath = path.join(workDir, `intro_${introSeconds.toFixed(3)}s.mp3`);
   await extractIntroAudioClip(finalVideoPath, introAudioPath, introSeconds);
 
   const heygen = await generateHeyGenAvatarFromAudio(introAudioPath, `Conveyer HeyGen Intro ${introSeconds}s`);
@@ -116,7 +163,9 @@ export async function applyHeyGenIntroToFinalVideoSafe(finalVideoPath: string, s
     outputPath: outPath,
     heygenVideoPath: heygen.outputPath,
     introAudioPath,
+    requestedSeconds,
     seconds: introSeconds,
+    cutReason: cut.reason,
     videoId: heygen.videoId,
     cached: heygen.cached,
     duration: heygen.duration,
