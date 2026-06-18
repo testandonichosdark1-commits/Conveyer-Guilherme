@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { ensureInit } from "@/lib/init";
-import { applyHeyGenIntroToFinalVideo } from "@/lib/services/heygen";
+import { applyHeyGenIntroToFinalVideoSafe } from "@/lib/services/heygen-intro";
 
 export async function POST(req: Request) {
   ensureInit();
@@ -14,7 +14,7 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: false, error: "finalPath is required." }, { status: 400 });
     }
 
-    const result = await applyHeyGenIntroToFinalVideo(finalPath, seconds);
+    const result = await applyHeyGenIntroToFinalVideoSafe(finalPath, seconds);
     return NextResponse.json({ ...result, originalPath: finalPath });
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
