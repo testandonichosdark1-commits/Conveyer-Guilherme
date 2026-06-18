@@ -108,13 +108,19 @@ export const ALL_GROUPS: Group[] = [
         key: "TTS_PROVIDER",
         label: "Voice engine",
         desc: "Voice engine used for narration.",
-        examples: "ai33pro · 69labs · kokoro · minimax · minimax-ai33pro",
+        examples: "ai33pro · 69labs · kokoro · minimax · minimax-ai33pro · edge-ai33pro",
       },
       {
         key: "AI33PRO_API_KEY",
         label: "ai33.pro key",
-        desc: "ai33.pro API key. Used for ai33pro, kokoro, and minimax-ai33pro engines.",
+        desc: "ai33.pro API key. Used for ai33pro, kokoro, minimax-ai33pro, and edge-ai33pro engines.",
         examples: "Paste locally only; never commit API keys.",
+      },
+      {
+        key: "AI33PRO_POLL_MAX_MINUTES",
+        label: "ai33.pro task timeout (minutes)",
+        desc: "Maximum time to wait for one ai33.pro TTS task before aborting. Useful when MiniMax/ai33.pro takes longer than normal.",
+        examples: "45 default · 60 safer for slow MiniMax jobs · 90 very patient",
       },
       {
         key: "LABS69_API_KEY",
