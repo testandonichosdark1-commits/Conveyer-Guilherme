@@ -167,10 +167,57 @@ async function pexelsPhoto(
 
 // ── Scene-mix distribution ──────────────────────────────────────────────────
 
+const HOOK_VIDEO_BIAS_SECONDS = 30;
+const HOOK_PHOTO_RATIO_PERCENT = 15; // 85% video / 15% photo in the opening hook.
+
+function pickPhotosWithinSubset(
+  scenes: Scene[],
+  target: number,
+  mode: "random" | "alternating"
+): Set<number> {
+  const picks = new Set<number>();
+  if (target <= 0 || scenes.length === 0) return picks;
+  const clampedTarget = Math.max(0, Math.min(scenes.length, target));
+
+  if (mode === "alternating") {
+    const step = scenes.length / clampedTarget;
+    for (let i = 0; picks.size < clampedTarget && i < scenes.length; i++) {
+      picks.add(scenes[Math.floor(i * step)].index);
+    }
+    return picks;
+  }
+
+  const indices = scenes.map((s) => s.index);
+  for (let i = indices.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [indices[i], indices[j]] = [indices[j], indices[i]];
+  }
+  return new Set(indices.slice(0, clampedTarget));
+}
+
+function splitHookScenes(scenes: Scene[]): { hook: Scene[]; rest: Scene[] } {
+  const hook: Scene[] = [];
+  const rest: Scene[] = [];
+  let accSec = 0;
+
+  for (const scene of scenes) {
+    const startsInHook = accSec < HOOK_VIDEO_BIAS_SECONDS;
+    if (startsInHook) hook.push(scene);
+    else rest.push(scene);
+    accSec += Math.max(1, Number(scene.duration_hint_sec || 5));
+  }
+
+  return { hook, rest };
+}
+
 /**
  * Picks which scenes get PHOTOS (the rest get videos). Photos render through
  * ken-burns zoom in/out in FFmpeg assembly, which gives a different visual
  * rhythm and helps when Pexels has a strong photo for a query but weak video.
+ *
+ * Global behavior:
+ *  - First ~30 seconds always favour VIDEO: about 85% video / 15% photo.
+ *  - After the first ~30 seconds, use SCENE_PHOTO_RATIO normally.
  *
  * Modes:
  *  - "random": shuffles scene indices and takes the first N (default)
@@ -181,26 +228,17 @@ export function pickPhotoScenes(
   photoRatioPercent: number,
   mode: "random" | "alternating" = "random"
 ): Set<number> {
+  if (scenes.length === 0) return new Set();
+
   const ratio = Math.max(0, Math.min(100, photoRatioPercent));
-  if (ratio === 0) return new Set();
-  if (ratio === 100) return new Set(scenes.map((s) => s.index));
+  const { hook, rest } = splitHookScenes(scenes);
 
-  const target = Math.max(1, Math.round((scenes.length * ratio) / 100));
+  const hookPhotoTarget = Math.round((hook.length * HOOK_PHOTO_RATIO_PERCENT) / 100);
+  const restPhotoTarget = Math.round((rest.length * ratio) / 100);
 
-  if (mode === "alternating") {
-    const step = scenes.length / target;
-    const picks = new Set<number>();
-    for (let i = 0; picks.size < target && i < scenes.length; i++) {
-      picks.add(scenes[Math.floor(i * step)].index);
-    }
-    return picks;
-  }
+  const picked = new Set<number>();
+  for (const idx of pickPhotosWithinSubset(hook, hookPhotoTarget, mode)) picked.add(idx);
+  for (const idx of pickPhotosWithinSubset(rest, restPhotoTarget, mode)) picked.add(idx);
 
-  // "random" — Fisher–Yates shuffle, take first N
-  const indices = scenes.map((s) => s.index);
-  for (let i = indices.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [indices[i], indices[j]] = [indices[j], indices[i]];
-  }
-  return new Set(indices.slice(0, target));
+  return picked;
 }
