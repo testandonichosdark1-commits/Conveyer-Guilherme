@@ -20,9 +20,13 @@ CRITICAL RULES:
 VISUAL SOURCING RULES:
 - Do NOT try to illustrate abstract words directly. If a line is explanatory, rhetorical, transitional, promising what will happen, or hard to show literally, keep the viewer inside the physical world of the video instead.
 - For abstract/non-literal lines, use contextual fallback visuals from the video's main topic, people, setting, objects, tools, ingredients, and process.
-- Avoid generic metaphor stock footage unless the script explicitly names it as the real subject. Avoid things like money, calculators, receipts, charts, office workers, handshakes, light bulbs, puzzle pieces, locks, clocks, generic laptops, abstract animations, and green-screen subscribe graphics when they are only symbolic metaphors.
+- For literal lines, NEVER let a generic verb/place overpower the actual subject. A query must keep the real object/topic visible. If the line says someone buys or throws away cheese, the query must still include cheese/dairy/curds/container/kitchen — not just store, shopping, trash, waste, paper, or garbage.
+- If the exact literal action is too hard to find as stock footage, use the video's topical fallback rather than a loose symbolic match. Better to show on-topic cheese/kitchen/farmhouse footage than an unrelated store aisle or paper trash can.
+- Avoid generic metaphor stock footage unless the script explicitly names it as the real subject. Avoid things like money, calculators, receipts, charts, office workers, handshakes, light bulbs, puzzle pieces, locks, clocks, generic laptops, abstract animations, paper trash, empty trash cans, and green-screen subscribe graphics when they are only symbolic or loosely related.
 - Examples:
   • Amish cheese video + "the cost will make sense" → use "Amish family kitchen", "homemade cheese preparation", "rustic farmhouse cooking"; NOT money/calculator/receipt.
+  • Amish cheese video + "standing in the dairy aisle, pick up fresh cheese" → use "dairy aisle cheese", "fresh cheese container", "ricotta grocery shelf"; NOT generic mini market, convenience store, or random shopper.
+  • Amish cheese video + "throw the rest away" → use "leftover cheese container", "cheese in kitchen trash", or fallback "homemade cheese kitchen"; NOT paper balls, office trash, or generic waste basket.
   • Japanese gardening video + "why this method works" → use "hands planting vegetables", "garden soil close up", "healthy cucumber plants"; NOT light bulb/charts.
   • Old mechanic video + "the old trick will make sense" → use "rusty tools workbench", "old mechanic workshop", "hands cleaning metal"; NOT generic idea/brain/gear graphics.
 
@@ -30,14 +34,14 @@ For EACH scene, return a JSON object with:
 - "text": the exact verbatim slice of the script (no edits, no punctuation changes).
 - "visual_queries": an ARRAY of 2–3 SHORT Pexels search queries (BEST first), each 2–5 words, describing what the viewer should SEE while this line is narrated. Rules:
     • Describe the MAIN visual of the WHOLE thought, judged from context — NOT a literal match of every word.
-    • **CARRY THE SETTING.** Keep the current location/place in the query when the sentence itself doesn't name one. Example: if the story is set in a pharmacy and the line is "you put the bottle in your basket", search "pharmacy shopping basket" / "drugstore shelf products" — NOT a bare "bottle" or a random "bathroom basket". The setting only changes when the script clearly moves somewhere else.
+    • **CARRY THE SETTING AND THE SUBJECT.** Keep the current location/place AND the important object/topic in the query when the sentence itself contains a generic action. Example: "throw the rest away" in a cheese video should become "leftover cheese container", not "trash can". Example: "buy it" in a cheese video should become "fresh cheese grocery shelf", not "shopper store".
     • **IGNORE incidental or out-of-place words.** For "you grab your rusty wrench from the garage, candy" → "rusty wrench garage", "tools workbench" — NEVER "candy".
     • For an abstract/transitional line with no concrete image (a promise, statistic, reason, cost, lesson, explanation, rhetorical line, "by the end", "this will make sense"), use topical/contextual fallback visuals from the video's physical world, not symbolic metaphor visuals.
-    • Give 2–3 genuinely DIFFERENT angles (not the same words reworded) so if the first finds nothing, the next still fits — e.g. ["pharmacy shopping basket", "hand picking medicine shelf", "drugstore aisle"].
+    • Give 2–3 genuinely DIFFERENT angles (not the same words reworded) so if the first finds nothing, the next still fits — e.g. ["dairy aisle cheese", "fresh cheese container", "homemade cheese kitchen"].
     • Use plain concrete nouns that exist as stock footage ("rusty tools workbench", "city street night", "ocean waves rocks"). NO abstract words ("concept", "idea", "tradition", "natural"), NO brand names, NO specific real people.
 - "literal_visualizable": boolean. Use false when the line is mainly abstract, explanatory, rhetorical, transitional, or hard to show literally without generic metaphor footage. Use true when the line has a concrete visible action/object/place.
 - "fallback_queries": an ARRAY of 2–4 SHORT Pexels queries for safe contextual fallback visuals from the video's main topic/world. For literal scenes, these may still be provided as backup. For abstract scenes, these should be the best queries and should overlap with or replace visual_queries.
-- "avoid": an ARRAY of 0–8 concrete things to avoid for this scene, especially generic metaphors that would be off-topic. Omit symbolic visuals unless the script explicitly names them as real objects in the scene.
+- "avoid": an ARRAY of 0–8 concrete things to avoid for this scene, especially generic metaphors or generic verb-only visuals that would be off-topic. Omit symbolic visuals unless the script explicitly names them as real objects in the scene.
 - "duration_hint_sec": approximate audio length (number, 4–8).
 - "overlay" (OPTIONAL): include this field ONLY when the line contains a STRIKING, concrete number, money amount, year, percentage, or short place name worth flashing on screen as big text. The value is the EXACT short text to display, copied as spoken (e.g. "$400", "1998", "73%", "Texas"). Keep it ≤ 12 characters. Use it SPARINGLY — a few per script at most, ideally in the opening lines. If the line has no such striking token, OMIT the field entirely (do not output an empty string).
 
@@ -49,7 +53,7 @@ Return a STRICTLY valid JSON array — no markdown, no explanations.`,
  * re-seeds existing installs to the new default once (there is no prompt-edit UI,
  * so the stored row is always our seeded default — safe to overwrite).
  */
-const SCENE_SPLIT_VERSION = "5";
+const SCENE_SPLIT_VERSION = "6";
 
 const getStmt = db.prepare("SELECT content FROM prompts WHERE name = ?");
 const upsertStmt = db.prepare(
