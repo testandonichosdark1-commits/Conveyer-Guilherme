@@ -16,6 +16,12 @@ export interface Scene {
    * to [visual_prompt] for older scene data that predates this field.
    */
   visual_queries: string[];
+  /** False for abstract/transitional/explanatory lines that should use contextual topic fallback. */
+  literal_visualizable?: boolean;
+  /** Safe topical fallback queries from the video's physical world. */
+  fallback_queries?: string[];
+  /** Scene-specific visual items to avoid, usually generic metaphors. */
+  avoid?: string[];
   duration_hint_sec: number;
   /**
    * Optional short on-screen text to flash for this scene — a striking number,
@@ -74,6 +80,25 @@ export async function splitScriptPreview(script: string): Promise<Scene[]> {
   return enforceMaxSceneLength(rawScenes);
 }
 
+function cleanStringArray(value: unknown, maxItems: number, maxChars: number): string[] {
+  if (!Array.isArray(value)) return [];
+  const out = value
+    .map((v) => String(v ?? "").trim())
+    .filter(Boolean)
+    .map((v) => v.slice(0, maxChars));
+  return [...new Set(out)].slice(0, maxItems);
+}
+
+function parseLiteralVisualizable(value: unknown): boolean | undefined {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    const v = value.trim().toLowerCase();
+    if (["true", "yes", "literal"].includes(v)) return true;
+    if (["false", "no", "abstract", "fallback"].includes(v)) return false;
+  }
+  return undefined;
+}
+
 async function processChunk(
   systemPrompt: string,
   scriptChunk: string,
@@ -115,20 +140,34 @@ async function processChunk(
     // New format: visual_queries[] (2–3 candidates). Old format: a single
     // visual_prompt string. Accept both so older prompts / cached rows still work.
     const rawQueries: unknown = (s as { visual_queries?: unknown }).visual_queries;
-    let queries: string[] = Array.isArray(rawQueries)
-      ? rawQueries.map((q) => String(q ?? "").trim()).filter(Boolean)
-      : [];
+    let queries: string[] = cleanStringArray(rawQueries, 4, 80);
+    const fallbackQueries = cleanStringArray((s as { fallback_queries?: unknown }).fallback_queries, 4, 80);
+    const avoid = cleanStringArray((s as { avoid?: unknown }).avoid, 8, 60);
+    const literalVisualizable = parseLiteralVisualizable((s as { literal_visualizable?: unknown }).literal_visualizable);
+
     const legacyPrompt = String((s as { visual_prompt?: unknown }).visual_prompt ?? "").trim();
     if (queries.length === 0 && legacyPrompt) queries = [legacyPrompt];
-    // De-duplicate while preserving order; cap at 3 candidates.
-    queries = [...new Set(queries)].slice(0, 3);
+
+    // For abstract/explanatory scenes, promote topical fallback queries so the
+    // stock search stays inside the video's world instead of using symbolic B-roll.
+    if (literalVisualizable === false && fallbackQueries.length > 0) {
+      queries = [...fallbackQueries, ...queries];
+    } else if (fallbackQueries.length > 0) {
+      queries = [...queries, ...fallbackQueries];
+    }
+
+    // De-duplicate while preserving order; cap at 4 candidates.
+    queries = [...new Set(queries)].slice(0, 4);
     const overlayRaw = String((s as { overlay?: unknown }).overlay ?? "").trim();
     return {
       index: i,
-      text: String(s.text ?? ""),
+      text: String((s as { text?: unknown }).text ?? ""),
       visual_prompt: legacyPrompt || queries[0] || "",
       visual_queries: queries,
-      duration_hint_sec: Number(s.duration_hint_sec ?? 6),
+      literal_visualizable: literalVisualizable,
+      fallback_queries: fallbackQueries,
+      avoid,
+      duration_hint_sec: Number((s as { duration_hint_sec?: unknown }).duration_hint_sec ?? 6),
       overlay: overlayRaw ? overlayRaw.slice(0, 16) : undefined,
     };
   });
@@ -161,6 +200,9 @@ function enforceMaxSceneLength(scenes: Scene[]): Scene[] {
         // back into one segment with these same queries anyway).
         visual_prompt: s.visual_prompt,
         visual_queries: s.visual_queries,
+        literal_visualizable: s.literal_visualizable,
+        fallback_queries: s.fallback_queries,
+        avoid: s.avoid,
         duration_hint_sec: Math.min(6, Math.max(2, Math.round((chunkWords.length / 150) * 60))),
         // Keep the overlay on the FIRST chunk only so it isn't shown twice.
         overlay: first ? s.overlay : undefined,
