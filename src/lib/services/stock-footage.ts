@@ -613,8 +613,81 @@ function sceneQueryCandidates(scene: Scene): string[] {
     scene.visual_queries && scene.visual_queries.length > 0
       ? scene.visual_queries
       : [scene.visual_prompt];
-  const cleaned = raw.map((q) => visualPromptToQuery(q)).filter(Boolean);
+  const fallback = Array.isArray(scene.fallback_queries) ? scene.fallback_queries : [];
+  const combined = scene.literal_visualizable === false
+    ? [...fallback, ...raw]
+    : [...raw, ...fallback];
+  const cleaned = combined.map((q) => visualPromptToQuery(q)).filter(Boolean);
   return [...new Set(cleaned)];
+}
+
+// ── Opening Topic Lock ───────────────────────────────────────────────────────
+// The opening hook often contains broad actions ("buy it", "throw it away") that
+// are technically literal but visually dangerous: stock search may pick generic
+// stores, trash cans, paper, money, etc. During the first ~30s, require/strongly
+// favour assets that still show the video's main topic or visual world.
+
+const OPENING_GENERIC_VISUAL_TERMS = new Set([
+  "store", "shop", "shopper", "shopping", "supermarket", "market", "grocery",
+  "aisle", "mall", "retail", "checkout", "cashier", "cart", "basket",
+  "trash", "garbage", "waste", "bin", "dumpster", "recycle", "paper", "papers",
+  "money", "cash", "dollar", "dollars", "coin", "coins", "wallet", "price",
+  "receipt", "calculator", "chart", "graph", "office", "business", "laptop",
+  "computer", "meeting", "handshake", "light", "bulb", "idea", "puzzle",
+  "lock", "clock", "subscribe", "button", "greenscreen", "green", "screen",
+]);
+
+const OPENING_ANCHOR_EXCLUDE_TERMS = new Set([
+  ...OPENING_GENERIC_VISUAL_TERMS,
+  "fresh", "small", "large", "old", "new", "good", "bad", "simple", "complete",
+  "style", "method", "process", "reason", "cost", "habit", "sense", "end",
+  "make", "makes", "made", "making", "buy", "bought", "bring", "throw", "away",
+  "pick", "stand", "standing", "use", "using", "week", "later", "home",
+  "container", "plastic", "food", "thing", "things", "people", "person",
+  "hand", "hands", "close", "closeup", "close-up", "shot", "view",
+]);
+
+function cleanedAnchorTokensFromText(text: string): string[] {
+  return relevanceTokens(text)
+    .map(stemWord)
+    .filter((t) => t.length >= 3 && !OPENING_ANCHOR_EXCLUDE_TERMS.has(t));
+}
+
+function openingTopicAnchors(scene: Scene, videoContext: string, anchorWords?: string[]): string[] {
+  const raw: string[] = [];
+  if (anchorWords && anchorWords.length > 0) raw.push(...anchorWords);
+  raw.push(videoContext);
+  raw.push(scene.visual_prompt || "");
+  raw.push(...(scene.visual_queries || []));
+  raw.push(...(scene.fallback_queries || []));
+
+  // Avoid making the current narration itself the primary anchor source: hook
+  // narration may mention generic actions ("throw away") more strongly than the
+  // real subject. The scene queries/context already carry the intended topic.
+  const out = new Set<string>();
+  for (const part of raw) {
+    for (const t of cleanedAnchorTokensFromText(part)) out.add(t);
+  }
+  return [...out].slice(0, 24);
+}
+
+function candidateMatchesAnyAnchor(candTokens: string[], openingAnchors: string[]): boolean {
+  if (openingAnchors.length === 0) return true;
+  return openingAnchors.some((anchor) => candTokens.some((ct) => tokensMatch(ct, anchor)));
+}
+
+function candidateHasGenericVisual(candTokens: string[]): boolean {
+  return candTokens.some((t) => OPENING_GENERIC_VISUAL_TERMS.has(stemWord(t)) || OPENING_GENERIC_VISUAL_TERMS.has(t));
+}
+
+function sceneAvoidTokens(scene: Scene): string[] {
+  const avoid = Array.isArray(scene.avoid) ? scene.avoid : [];
+  return [...new Set(avoid.flatMap((x) => relevanceTokens(String(x))).map(stemWord))];
+}
+
+function candidateMatchesAvoid(candTokens: string[], avoidTokens: string[]): boolean {
+  if (avoidTokens.length === 0) return false;
+  return avoidTokens.some((avoid) => candTokens.some((ct) => tokensMatch(ct, avoid)));
 }
 
 // ── Relevance scoring (local, zero extra API calls) ──────────────────────────
@@ -1197,7 +1270,9 @@ async function aiScoreHitsByVision(
   runId: string,
   sceneText: string,
   videoContext: string,
-  hits: FootageHit[]
+  hits: FootageHit[],
+  openingTopicLock = false,
+  openingAnchors: string[] = []
 ): Promise<Map<string, number> | null> {
   if ((getSetting("FOOTAGE_AI_PICK") || "on").trim().toLowerCase() === "off") return null;
   const apiKey = getSetting("GOOGLE_API_KEY").trim();
@@ -1208,7 +1283,7 @@ async function aiScoreHitsByVision(
   }
 
   const model = getSetting("GEMINI_VISION_MODEL") || "gemini-flash-latest";
-  const visualIntentRepr = `intent:${sceneText} context:${videoContext}`;
+  const visualIntentRepr = `intent:${sceneText} context:${videoContext} opening:${openingTopicLock ? "1" : "0"} anchors:${openingAnchors.join(",")}`;
   const intentHash = getShortHash(visualIntentRepr);
 
   const scoresMap = new Map<string, number>();
@@ -1264,13 +1339,18 @@ async function aiScoreHitsByVision(
 
     getOrCreateStats(runId).geminiVisionCalls++;
 
+    const openingRule = openingTopicLock
+      ? `OPENING TOPIC LOCK IS ACTIVE. This is from the first ~30 seconds of the video. Strongly prefer visuals that visibly stay anchored to the video's main topic or visual world (${openingAnchors.slice(0, 12).join(", ")}). Score generic verb-only/place-only/metaphor visuals very low if they do not visibly show the topic/world, such as generic stores, shoppers, trash, paper, money, office, charts, laptops, light bulbs, or subscribe graphics.\n`
+      : "";
+
     const parts: unknown[] = [
       {
         text:
           `You are choosing B-roll footage for ONE moment of a video.\n` +
           (videoContext ? `The whole video is about: "${videoContext.slice(0, 300)}".\n` : "") +
-          `This moment's narration: "${sceneText.slice(0, 300)}".\n\n` +
-          `${usable.length} candidate images follow, each labelled "index N". LOOK AT EACH IMAGE and score 0-100 how well what is ACTUALLY SHOWN fits this moment AND the video's overall context (100 = perfect on-screen match). Judge only by the visible content, not by any text.\n` +
+          `This moment's narration: "${sceneText.slice(0, 300)}".\n` +
+          openingRule +
+          `\n${usable.length} candidate images follow, each labelled "index N". LOOK AT EACH IMAGE and score 0-100 how well what is ACTUALLY SHOWN fits this moment AND the video's overall context (100 = perfect on-screen match). Judge only by the visible content, not by any text.\n` +
           `Return STRICTLY a JSON array [{"i":<N>,"score":<int>}] covering all ${usable.length}. No markdown.`,
       },
     ];
@@ -1337,6 +1417,9 @@ interface PoolHit {
   score: number;        // 0..1 — vision score if available, else local text score
   via: "vision" | "text";
   query: string;
+  openingAnchorMatch?: boolean;
+  openingGeneric?: boolean;
+  avoidMatch?: boolean;
 }
 
 /**
@@ -1364,7 +1447,17 @@ async function acquireFootage(
   outPath: string,
   options: AcquireOptions
 ): Promise<{ author: string | null; sourceUrl: string; source: string; dedupeId: string }> {
-  const { runId, orientation = "landscape", maxHeight = 1080, minDuration = 4, usedIds, avoidDedupeIds, videoContext = "", anchorWords } = options;
+  const {
+    runId,
+    orientation = "landscape",
+    maxHeight = 1080,
+    minDuration = 4,
+    usedIds,
+    avoidDedupeIds,
+    videoContext = "",
+    anchorWords,
+    openingTopicLock = false,
+  } = options;
   const gatherOpts = { runId, orientation, maxHeight, minDuration };
 
   const baseQueries = sceneQueryCandidates(scene);
@@ -1372,6 +1465,16 @@ async function acquireFootage(
     throw new Error(`Scene #${scene.index}: empty query (no visual_queries)`);
   }
   const queryTokenLists = baseQueries.map(relevanceTokens);
+  const openingAnchors = openingTopicLock ? openingTopicAnchors(scene, videoContext, anchorWords) : [];
+  const avoidTokens = sceneAvoidTokens(scene);
+  if (openingTopicLock) {
+    log(
+      runId,
+      "debug",
+      `Opening Topic Lock active for scene #${scene.index} (${openingAnchors.slice(0, 8).join(", ") || "no anchors"})`,
+      { stage: "animate" }
+    );
+  }
   let lastErr: unknown;
 
   const tryList = async (list: PoolHit[], ignoreAvoidList = false) => {
@@ -1384,6 +1487,21 @@ async function acquireFootage(
 
       if (!ignoreAvoidList && avoidDedupeIds && avoidDedupeIds.has(s.hit.dedupeId)) {
         log(runId, "warn", `Skipping adjacent duplicate footage: ${s.hit.dedupeId}`, { stage: "animate" });
+        continue;
+      }
+
+      if (
+        !ignoreAvoidList &&
+        openingTopicLock &&
+        s.openingGeneric &&
+        !s.openingAnchorMatch
+      ) {
+        log(
+          runId,
+          "warn",
+          `Opening Topic Lock skipped generic off-topic asset: ${s.hit.dedupeId} (${s.hit.desc.slice(0, 80) || "no description"})`,
+          { stage: "animate" }
+        );
         continue;
       }
 
@@ -1439,13 +1557,39 @@ async function acquireFootage(
     // Local text score — used to pre-pick which thumbnails to send to vision,
     // and as the fallback score when vision is unavailable.
     const localScored = hits
-      .map((h) => ({ hit: h, local: relevanceScore(relevanceTokens(h.desc), queryTokenLists, anchorWords) }))
+      .map((h) => {
+        const candTokens = relevanceTokens(h.desc);
+        const openingAnchorMatch = openingTopicLock
+          ? candidateMatchesAnyAnchor(candTokens, openingAnchors)
+          : true;
+        const openingGeneric = openingTopicLock ? candidateHasGenericVisual(candTokens) : false;
+        const avoidMatch = candidateMatchesAvoid(candTokens, avoidTokens);
+        let local = relevanceScore(candTokens, queryTokenLists, anchorWords);
+
+        if (avoidMatch && !openingAnchorMatch) {
+          local *= 0.1;
+        } else if (avoidMatch) {
+          local *= 0.55;
+        }
+
+        if (openingTopicLock && openingAnchors.length > 0 && !openingAnchorMatch) {
+          // In the opening hook, a generic store/trash/paper/etc. clip should not
+          // beat a weaker but topical clip. Still keep a tiny score so the scene
+          // can fall back if absolutely nothing on-topic exists.
+          local *= openingGeneric ? 0.02 : 0.2;
+        }
+
+        return { hit: h, local, openingAnchorMatch, openingGeneric, avoidMatch };
+      })
       .sort((a, b) => b.local - a.local);
 
     // Apply avoid/filtering before vision scoring:
     let candidatesToScore = localScored.filter(x => {
       // Exclude adjacent duplicate IDs from vision checks
       if (avoidDedupeIds && avoidDedupeIds.has(x.hit.dedupeId)) {
+        return false;
+      }
+      if (openingTopicLock && x.openingGeneric && !x.openingAnchorMatch) {
         return false;
       }
       return x.local > 0; // Don't send completely bad matches to Vision
@@ -1459,14 +1603,26 @@ async function acquireFootage(
     const visLimit = Math.max(1, Number(getSetting("VISION_CANDIDATE_LIMIT") || "8"));
     const toScore = candidatesToScore.slice(0, visLimit).map((x) => x.hit);
 
-    const vision = await aiScoreHitsByVision(runId, scene.text, videoContext, toScore);
+    const vision = await aiScoreHitsByVision(runId, scene.text, videoContext, toScore, openingTopicLock, openingAnchors);
     for (const x of localScored) {
       const v = vision?.get(x.hit.dedupeId);
+      let score = v !== undefined ? v : x.local;
+
+      if (openingTopicLock && openingAnchors.length > 0 && !x.openingAnchorMatch) {
+        score = Math.min(score, x.openingGeneric ? 0.15 : 0.35);
+      }
+      if (x.avoidMatch && !x.openingAnchorMatch) {
+        score = Math.min(score, 0.15);
+      }
+
       pool.push({
         hit: x.hit,
-        score: v !== undefined ? v : x.local,
+        score,
         via: v !== undefined ? "vision" : "text",
         query,
+        openingAnchorMatch: x.openingAnchorMatch,
+        openingGeneric: x.openingGeneric,
+        avoidMatch: x.avoidMatch,
       });
     }
     pool.sort((a, b) => b.score - a.score);
@@ -1513,6 +1669,16 @@ async function acquireFootage(
     if (got) return got;
   }
 
+  // Absolute last resort for the opening hook: do not fail the video if every
+  // candidate lacks topic anchors, but make this visible in the log.
+  if (openingTopicLock && pool.length > 0) {
+    log(runId, "warn", `Scene #${scene.index}: Opening Topic Lock found no anchored asset. Using best available only as last resort.`, {
+      stage: "animate",
+    });
+    const got = await tryList(pool, true);
+    if (got) return got;
+  }
+
   const tried = baseQueries.map((q) => `"${q}"`).join(", ");
   throw new Error(
     `No ${kind} found for scene #${scene.index} across [${configuredFootageSources().join("+")}] (tried ${tried})` +
@@ -1539,6 +1705,8 @@ export interface AcquireOptions {
   /** One-line summary of the whole video, for the vision relevance scorer. */
   videoContext?: string;
   anchorWords?: string[];
+  /** Strongly reject generic opening-hook assets that miss the topic/world anchors. */
+  openingTopicLock?: boolean;
 }
 
 /**
@@ -1576,6 +1744,8 @@ export interface AcquirePhotoOptions {
   /** One-line summary of the whole video, for the vision relevance scorer. */
   videoContext?: string;
   anchorWords?: string[];
+  /** Strongly reject generic opening-hook assets that miss the topic/world anchors. */
+  openingTopicLock?: boolean;
 }
 
 /**

@@ -46,6 +46,19 @@ export interface AnimateOptions {
    *  so footage is judged against the overall context, not just this moment. */
   videoContext?: string;
   anchorWords?: string[];
+  /** Force stricter topic/world anchoring for opening-hook scenes. */
+  openingTopicLock?: boolean;
+}
+
+const OPENING_TOPIC_LOCK_SECONDS = 30;
+
+function isLikelyOpeningScene(scene: Scene): boolean {
+  // Approximate opening position without changing the pipeline API. The pipeline
+  // assigns zero-based scene indices and duration hints; for single-shot mode this
+  // is close enough to catch the first hook scenes, where generic B-roll errors
+  // are most common.
+  const hintSec = Math.max(1, Number(scene.duration_hint_sec || 5));
+  return scene.index * hintSec < OPENING_TOPIC_LOCK_SECONDS;
 }
 
 export async function animateScene(
@@ -55,6 +68,7 @@ export async function animateScene(
   options: AnimateOptions = {}
 ): Promise<AnimateResult | null> {
   const mode: AssetMode = options.mode ?? "video";
+  const openingTopicLock = options.openingTopicLock ?? isLikelyOpeningScene(scene);
 
   const ext = mode === "photo" ? "jpg" : "mp4";
   const stem = options.fileStem || `scene_${String(scene.index).padStart(3, "0")}`;
@@ -63,14 +77,14 @@ export async function animateScene(
 
   log(runId, "info", `Stock ${mode} for scene #${scene.index}`, {
     stage: "animate",
-    data: { mode, prompt: scene.visual_prompt.slice(0, 120) },
+    data: { mode, openingTopicLock, prompt: scene.visual_prompt.slice(0, 120) },
   });
 
   let assetInfo;
   if (mode === "photo") {
-    assetInfo = await pexelsPhoto(runId, scene, filePath, options.photoUsedIds, options.avoidDedupeIds, options.videoContext, options.anchorWords);
+    assetInfo = await pexelsPhoto(runId, scene, filePath, options.photoUsedIds, options.avoidDedupeIds, options.videoContext, options.anchorWords, openingTopicLock);
   } else {
-    assetInfo = await pexelsClip(runId, scene, filePath, options.videoUsedIds, options.avoidDedupeIds, options.videoContext, options.anchorWords);
+    assetInfo = await pexelsClip(runId, scene, filePath, options.videoUsedIds, options.avoidDedupeIds, options.videoContext, options.anchorWords, openingTopicLock);
   }
 
   log(runId, "success", `Asset ready: ${fileName}`, { stage: "animate" });
@@ -86,7 +100,8 @@ async function pexelsClip(
   usedIds?: Set<string>,
   avoidDedupeIds?: Set<string>,
   videoContext?: string,
-  anchorWords?: string[]
+  anchorWords?: string[],
+  openingTopicLock?: boolean
 ): Promise<{ author: string | null; sourceUrl: string; source: string; dedupeId?: string }> {
   const orientation = (getSetting("STOCK_FOOTAGE_ORIENTATION") || "landscape") as Orientation;
   const maxHeight = Math.max(360, Number(getSetting("STOCK_FOOTAGE_MAX_HEIGHT") || "1080"));
@@ -105,6 +120,7 @@ async function pexelsClip(
         avoidDedupeIds,
         videoContext,
         anchorWords,
+        openingTopicLock,
       });
     } catch (e) {
       lastErr = e;
@@ -131,7 +147,8 @@ async function pexelsPhoto(
   usedIds?: Set<string>,
   avoidDedupeIds?: Set<string>,
   videoContext?: string,
-  anchorWords?: string[]
+  anchorWords?: string[],
+  openingTopicLock?: boolean
 ): Promise<{ author: string | null; sourceUrl: string; source: string; dedupeId?: string }> {
   const orientation = (getSetting("STOCK_FOOTAGE_ORIENTATION") || "landscape") as Orientation;
   const maxHeight = Math.max(360, Number(getSetting("STOCK_FOOTAGE_MAX_HEIGHT") || "1080"));
@@ -148,6 +165,7 @@ async function pexelsPhoto(
         avoidDedupeIds,
         videoContext,
         anchorWords,
+        openingTopicLock,
       });
     } catch (e) {
       lastErr = e;
