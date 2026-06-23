@@ -139,29 +139,28 @@ async function ai33proV3Tts(runId: string, text: string, outPath: string): Promi
     throw new Error("No ai33pro V3 ElevenLabs voice set — paste an ElevenLabs voice id into Settings → TTS_VOICE_ID");
   }
 
-  const rawVoiceId = `elevenlabs_${voiceId}`;
-  const modelId = getSetting("TTS_MODEL") || "eleven_multilingual_v2";
+  const speed = readSpeed(0.5, 1.5, 1);
 
   try {
     const taskId = await createV3SpeechTask(text, {
-      provider: "elevenlabs",
-      rawVoiceId,
       voiceId,
-      modelId,
+      speed,
       withTranscript: false,
+      contextChaining: false,
+      language: "auto",
+      similarity: 2,
     });
-    log(runId, "debug", `ElevenLabs (ai33pro V3) TTS task ${taskId.slice(0, 8)}… (${modelId} / ${rawVoiceId})`, { stage: "tts" });
+    log(runId, "debug", `ElevenLabs (ai33pro V3) TTS task ${taskId.slice(0, 8)}… (${voiceId}, speed=${speed})`, { stage: "tts" });
     const task = await pollV3Task(taskId, runId, "tts");
     await downloadV3Task(task, outPath);
-    await maybeApplyTempo(runId, outPath, "ElevenLabs ai33pro V3 / atempo");
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     if (isUnauthorizedError(msg)) {
       throw new Error(
-        `${msg} — ElevenLabs via ai33.pro V3 requires access to the ai33.pro V3 API for this API key.`
+        `${msg} — ai33.pro V3 now expects xi-api-key + FormData with a prefixed voice_id. Check your AI33PRO_API_KEY and TTS_VOICE_ID.`
       );
     }
-    throw new Error(`${msg} — check the ElevenLabs V3 voice "${rawVoiceId}" and model "${modelId}" are valid for this ai33.pro account.`);
+    throw new Error(`${msg} — check the ElevenLabs V3 voice "${voiceId}" is valid for this ai33.pro account.`);
   }
 }
 
@@ -268,7 +267,8 @@ function normalizeVoiceId(raw: string): string {
 function resolveElevenLabsAi33proV3VoiceId(raw: string): string {
   let v = raw.trim();
   if (!v) return "";
-  v = v.replace(/^(elevenlabs_|edge_|edgetts_|minimax_|kokoro_|clone_)/i, "");
+  v = v.replace(/^(edge_|edgetts_|minimax_|kokoro_|clone_)/i, "");
+  if (!/^elevenlabs_/i.test(v)) v = `elevenlabs_${v}`;
   return v;
 }
 
