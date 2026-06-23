@@ -257,9 +257,32 @@ async function fetchV3WithAuth(
 
 export interface CreateV3SpeechOptions {
   voiceId: string;
+  /** V3 provider, for example "elevenlabs". When set, the request uses the ai33.pro V3 JSON envelope. */
+  provider?: string;
+  /** Provider-prefixed raw V3 voice id, for example "elevenlabs_xxx". */
+  rawVoiceId?: string;
   speed?: number;
   modelId?: string;
   withTranscript?: boolean;
+}
+
+function buildV3JsonEnvelope(text: string, opts: CreateV3SpeechOptions): string {
+  const provider = opts.provider?.trim();
+  const rawVoiceId = (opts.rawVoiceId || opts.voiceId).trim();
+  const data: Record<string, unknown> = {
+    ...(opts.modelId ? { model_id: opts.modelId } : {}),
+    with_transcript: opts.withTranscript ?? false,
+  };
+
+  const payload = {
+    v3: provider ? { provider, raw_voice_id: rawVoiceId } : undefined,
+    data,
+    query: {},
+    voice_id: opts.voiceId,
+    text,
+  };
+
+  return JSON.stringify(payload);
 }
 
 export async function createV3SpeechTask(text: string, opts: CreateV3SpeechOptions): Promise<string> {
@@ -268,12 +291,21 @@ export async function createV3SpeechTask(text: string, opts: CreateV3SpeechOptio
   const url = `${V3_BASE}/text-to-speech`;
   const MAX_ATTEMPTS = 2;
   let lastErr: unknown;
+  const useJsonEnvelope = Boolean(opts.provider || opts.rawVoiceId);
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
       const resp = await fetchV3WithAuth(
         url,
         (headers) => {
+          if (useJsonEnvelope) {
+            return {
+              method: "POST",
+              headers: { ...headers, "Content-Type": "application/json" },
+              body: buildV3JsonEnvelope(text, opts),
+            };
+          }
+
           const form = new FormData();
           form.append("text", text);
           form.append("voice_id", opts.voiceId);
