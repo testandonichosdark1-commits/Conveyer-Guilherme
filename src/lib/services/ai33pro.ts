@@ -258,6 +258,7 @@ async function fetchV3WithAuth(
 export interface CreateV3SpeechOptions {
   voiceId: string;
   speed?: number;
+  modelId?: string;
   withTranscript?: boolean;
 }
 
@@ -276,6 +277,7 @@ export async function createV3SpeechTask(text: string, opts: CreateV3SpeechOptio
           const form = new FormData();
           form.append("text", text);
           form.append("voice_id", opts.voiceId);
+          if (opts.modelId) form.append("model_id", opts.modelId);
           if (opts.speed != null && Number.isFinite(opts.speed)) form.append("speed", String(opts.speed));
           form.append("with_transcript", String(opts.withTranscript ?? false));
           return { method: "POST", headers, body: form };
