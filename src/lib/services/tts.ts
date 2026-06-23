@@ -21,6 +21,7 @@ type TtsOptions = Record<string, never>;
 
 export type ResolvedTtsProvider =
   | "ai33pro"
+  | "ai33pro-v3"
   | "69labs"
   | "kokoro"
   | "minimax"
@@ -29,6 +30,11 @@ export type ResolvedTtsProvider =
 
 /**
  * The voice engine that will ACTUALLY be used for this run.
+ *
+ * ai33.pro ElevenLabs V3 support:
+ *   TTS_PROVIDER=ai33pro-v3
+ *   TTS_VOICE_ID=<ElevenLabs voice id>
+ *   TTS_MODEL=eleven_multilingual_v2, eleven_turbo_v2_5, etc.
  *
  * Edge support:
  *   TTS_PROVIDER=edge-ai33pro
@@ -43,6 +49,15 @@ export function resolveTtsProvider(): ResolvedTtsProvider {
   const hasAi33 = getSetting("AI33PRO_API_KEY").trim().length > 0;
   const has69 = getSetting("LABS69_API_KEY").trim().length > 0;
   const hasMinimax = getSetting("MINIMAX_API_KEY").trim().length > 0;
+
+  if (
+    selected === "ai33pro-v3" ||
+    selected === "ai33-v3" ||
+    selected === "elevenlabs-ai33pro-v3" ||
+    selected === "elevenlabs-v3"
+  ) {
+    return hasAi33 || !has69 ? "ai33pro-v3" : "69labs";
+  }
 
   if (selected === "edge-ai33pro" || selected === "edge" || selected === "edgetts") {
     if (hasAi33) return "edge-ai33pro";
@@ -91,6 +106,8 @@ async function dispatchTts(
     await minimaxAi33proTts(runId, text, outPath);
   } else if (provider === "edge-ai33pro") {
     await edgeAi33proTts(runId, text, outPath);
+  } else if (provider === "ai33pro-v3") {
+    await ai33proV3Tts(runId, text, outPath);
   } else {
     await ai33proTts(runId, text, outPath);
   }
@@ -114,6 +131,31 @@ async function ai33proTts(runId: string, text: string, outPath: string): Promise
   }
   await downloadTask(task, outPath);
   await maybeApplyTempo(runId, outPath, "ai33pro / atempo");
+}
+
+async function ai33proV3Tts(runId: string, text: string, outPath: string): Promise<void> {
+  const voiceId = resolveElevenLabsAi33proV3VoiceId(getSetting("TTS_VOICE_ID") || "");
+  if (!voiceId) {
+    throw new Error("No ai33pro V3 ElevenLabs voice set — paste an ElevenLabs voice id into Settings → TTS_VOICE_ID");
+  }
+
+  const modelId = getSetting("TTS_MODEL") || "eleven_multilingual_v2";
+  const speed = readSpeed(0.5, 2, 1);
+
+  try {
+    const taskId = await createV3SpeechTask(text, { voiceId, modelId, speed, withTranscript: false });
+    log(runId, "debug", `ElevenLabs (ai33pro V3) TTS task ${taskId.slice(0, 8)}… (${modelId} / ${voiceId}, speed=${speed})`, { stage: "tts" });
+    const task = await pollV3Task(taskId, runId, "tts");
+    await downloadV3Task(task, outPath);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (isUnauthorizedError(msg)) {
+      throw new Error(
+        `${msg} — ElevenLabs via ai33.pro V3 requires access to the ai33.pro V3 API for this API key.`
+      );
+    }
+    throw new Error(`${msg} — check the ElevenLabs V3 voice "${voiceId}" and model "${modelId}" are valid for this ai33.pro account.`);
+  }
 }
 
 async function labs69Tts(runId: string, text: string, outPath: string): Promise<void> {
@@ -214,6 +256,14 @@ function isUnauthorizedError(msg: string): boolean {
 
 function normalizeVoiceId(raw: string): string {
   return raw.trim().replace(/^elevenlabs_/i, "");
+}
+
+function resolveElevenLabsAi33proV3VoiceId(raw: string): string {
+  let v = raw.trim();
+  if (!v) return "";
+  v = v.replace(/^(edge_|edgetts_|minimax_|kokoro_|clone_)/i, "");
+  if (!/^elevenlabs_/i.test(v)) v = `elevenlabs_${v}`;
+  return v;
 }
 
 function resolveKokoroVoiceId(raw: string): string {
