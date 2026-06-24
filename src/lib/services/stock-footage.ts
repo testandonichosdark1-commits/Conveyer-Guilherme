@@ -1154,9 +1154,11 @@ function coverrApiKey(): string {
 }
 
 function coverrAuthVariants(key: string): Record<string, string>[] {
-  // Coverr documentation has exposed its API through slightly different
-  // rendered views over time, so try safe common API-key header variants.
+  // Coverr's public docs show a simple /videos curl, and the authenticated
+  // dashboard may accept different API-key headers. Try no-auth first, then
+  // common API-key header variants.
   return [
+    {},
     { Authorization: `Bearer ${key}` },
     { "x-api-key": key },
     { "api-key": key },
@@ -1194,24 +1196,118 @@ function coverrListFromResponse(data: any): CoverrVideo[] {
   return [];
 }
 
-async function coverrSignedVideoUrl(baseFilename: string, runId: string): Promise<string> {
-  const url = new URL(`https://api.coverr.co/storage/videos/${encodeURIComponent(baseFilename)}`);
-  const data = await coverrFetchJson(url, runId);
-  if (typeof data === "string") return data;
-  const signed =
-    data?.url ||
-    data?.signed_url ||
-    data?.signedUrl ||
-    data?.download_url ||
-    data?.downloadUrl ||
-    data?.mp4 ||
-    data?.data?.url ||
-    data?.data?.signed_url ||
-    data?.data?.download_url;
-  if (!signed || typeof signed !== "string") {
-    throw new Error(`Coverr signed URL missing for ${baseFilename}`);
+function coverrCandidateSearchUrls(query: string): URL[] {
+  const q = query.slice(0, 100);
+  const urls: URL[] = [];
+
+  // OpenAPI/docs have rendered this endpoint inconsistently. Try the likely
+  // route first, then the raw generated route name, then /videos fallbacks.
+  const search = new URL("https://api.coverr.co/search/videos");
+  search.searchParams.set("query", q);
+  urls.push(search);
+
+  const generatedSearch = new URL("https://api.coverr.co/search_videos_query_query");
+  generatedSearch.searchParams.set("query", q);
+  urls.push(generatedSearch);
+
+  const videosQuery = new URL("https://api.coverr.co/videos");
+  videosQuery.searchParams.set("query", q);
+  urls.push(videosQuery);
+
+  const videosSearch = new URL("https://api.coverr.co/videos");
+  videosSearch.searchParams.set("search", q);
+  urls.push(videosSearch);
+
+  // Guaranteed docs example: /videos?sort=popularity. We still filter locally.
+  const popular = new URL("https://api.coverr.co/videos");
+  popular.searchParams.set("sort", "popularity");
+  urls.push(popular);
+
+  return urls;
+}
+
+function coverrLocallyFilterVideos(query: string, videos: CoverrVideo[]): CoverrVideo[] {
+  const qTokens = relevanceTokens(query).map(stemWord);
+  if (qTokens.length === 0) return videos;
+
+  const filtered = videos.filter((v) => {
+    const desc = `${v.title || ""} ${v.name || ""} ${v.description || ""}`.trim();
+    const cTokens = relevanceTokens(desc).map(stemWord);
+    return qTokens.some((qt) => cTokens.some((ct) => tokensMatch(ct, qt)));
+  });
+
+  // If the popular feed has no exact local token match, still return it as a
+  // weak fallback instead of making Coverr useless for broad/abstract queries.
+  return filtered.length > 0 ? filtered : videos;
+}
+
+async function coverrSearchVideos(query: string, runId: string): Promise<CoverrVideo[]> {
+  let last404 = "";
+  for (const url of coverrCandidateSearchUrls(query)) {
+    try {
+      const data = await coverrFetchJson(url, runId);
+      const videos = coverrListFromResponse(data);
+      if (videos.length === 0) continue;
+
+      // For generic /videos fallbacks, apply local filtering against the query.
+      if (url.pathname === "/videos") return coverrLocallyFilterVideos(query, videos);
+      return videos;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (/404|not found/i.test(msg)) {
+        last404 = msg;
+        continue;
+      }
+      throw e;
+    }
   }
-  return signed;
+
+  if (last404) {
+    throw new Error(`${last404} — tried Coverr search endpoint fallbacks`);
+  }
+  return [];
+}
+
+async function coverrSignedVideoUrl(baseFilename: string, runId: string): Promise<string> {
+  const urls: URL[] = [];
+
+  urls.push(new URL(`https://api.coverr.co/storage/videos/${encodeURIComponent(baseFilename)}`));
+
+  const generatedStorage = new URL("https://api.coverr.co/storage_videos_base_filename");
+  generatedStorage.searchParams.set("base_filename", baseFilename);
+  urls.push(generatedStorage);
+
+  const storageQuery = new URL("https://api.coverr.co/storage/videos");
+  storageQuery.searchParams.set("base_filename", baseFilename);
+  urls.push(storageQuery);
+
+  let last404 = "";
+  for (const url of urls) {
+    try {
+      const data = await coverrFetchJson(url, runId);
+      if (typeof data === "string") return data;
+      const signed =
+        data?.url ||
+        data?.signed_url ||
+        data?.signedUrl ||
+        data?.download_url ||
+        data?.downloadUrl ||
+        data?.mp4 ||
+        data?.data?.url ||
+        data?.data?.signed_url ||
+        data?.data?.download_url;
+      if (signed && typeof signed === "string") return signed;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (/404|not found/i.test(msg)) {
+        last404 = msg;
+        continue;
+      }
+      throw e;
+    }
+  }
+
+  throw new Error(last404 || `Coverr signed URL missing for ${baseFilename}`);
 }
 
 async function coverrVideoHits(
@@ -1220,11 +1316,7 @@ async function coverrVideoHits(
 ): Promise<FootageHit[]> {
   if (!coverrApiKey()) return [];
 
-  const url = new URL("https://api.coverr.co/search/videos");
-  url.searchParams.set("query", query.slice(0, 100));
-
-  const data = await coverrFetchJson(url, opts.runId);
-  const videos = coverrListFromResponse(data);
+  const videos = await coverrSearchVideos(query, opts.runId);
   const hits: FootageHit[] = [];
 
   for (const v of videos) {
