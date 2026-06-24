@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { getSetting } from "../settings";
@@ -26,29 +27,40 @@ export type ResolvedTtsProvider =
   | "kokoro"
   | "minimax"
   | "minimax-ai33pro"
-  | "edge-ai33pro";
+  | "edge-ai33pro"
+  | "local-mp3";
 
 /**
  * The voice engine that will ACTUALLY be used for this run.
  *
+ * local-mp3 support:
+ *   TTS_PROVIDER=local-mp3
+ *   TTS_LOCAL_AUDIO_PATH=/absolute/path/to/full_voiceover.mp3
+ *   TTS_MODE=single-shot
+ *
  * ai33.pro ElevenLabs V3 support:
  *   TTS_PROVIDER=ai33pro-v3
- *   TTS_VOICE_ID=<ElevenLabs voice id>
- *   TTS_MODEL=eleven_multilingual_v2, eleven_turbo_v2_5, etc.
+ *   TTS_VOICE_ID=elevenlabs_<ElevenLabs voice id>
  *
  * Edge support:
  *   TTS_PROVIDER=edge-ai33pro
  *   TTS_VOICE_ID=en-US-GuyNeural, en-US-AriaNeural, etc.
- *
- * Edge voices use AI33PRO_API_KEY through the ai33.pro V3 API.
- * Do NOT fall back to V1 for Edge: the V1 endpoint is ElevenLabs-oriented and
- * appears as ElevenLabs in the ai33.pro dashboard.
  */
 export function resolveTtsProvider(): ResolvedTtsProvider {
   const selected = (getSetting("TTS_PROVIDER") || "ai33pro").trim().toLowerCase();
   const hasAi33 = getSetting("AI33PRO_API_KEY").trim().length > 0;
   const has69 = getSetting("LABS69_API_KEY").trim().length > 0;
   const hasMinimax = getSetting("MINIMAX_API_KEY").trim().length > 0;
+
+  if (
+    selected === "local-mp3" ||
+    selected === "manual-mp3" ||
+    selected === "mp3" ||
+    selected === "local-audio" ||
+    selected === "manual-audio"
+  ) {
+    return "local-mp3";
+  }
 
   if (
     selected === "ai33pro-v3" ||
@@ -96,7 +108,9 @@ async function dispatchTts(
   const text = rawText.replace(/\s+/g, " ").trim();
   const provider = resolveTtsProvider();
 
-  if (provider === "69labs") {
+  if (provider === "local-mp3") {
+    await localAudioTts(runId, outPath);
+  } else if (provider === "69labs") {
     await labs69Tts(runId, text, outPath);
   } else if (provider === "kokoro") {
     await kokoroTts(runId, text, outPath);
@@ -110,6 +124,46 @@ async function dispatchTts(
     await ai33proV3Tts(runId, text, outPath);
   } else {
     await ai33proTts(runId, text, outPath);
+  }
+}
+
+async function localAudioTts(runId: string, outPath: string): Promise<void> {
+  const inputPath = resolveLocalAudioPath(getSetting("TTS_LOCAL_AUDIO_PATH") || "");
+  if (!inputPath) {
+    throw new Error("TTS_PROVIDER=local-mp3 requires TTS_LOCAL_AUDIO_PATH in Settings.");
+  }
+  if (!fs.existsSync(inputPath)) {
+    throw new Error(`Local MP3 voiceover not found: ${inputPath}`);
+  }
+  const stat = fs.statSync(inputPath);
+  if (!stat.isFile() || stat.size <= 0) {
+    throw new Error(`Local MP3 voiceover is not a readable audio file: ${inputPath}`);
+  }
+
+  fs.mkdirSync(path.dirname(outPath), { recursive: true });
+  if (/\.mp3$/i.test(inputPath)) {
+    fs.copyFileSync(inputPath, outPath);
+  } else {
+    convertAudioToMp3(inputPath, outPath);
+  }
+  log(runId, "success", `Using local voiceover: ${inputPath}`, { stage: "tts" });
+}
+
+function resolveLocalAudioPath(raw: string): string {
+  const v = raw.trim();
+  if (!v) return "";
+  if (v === "~") return os.homedir();
+  if (v.startsWith("~/")) return path.join(os.homedir(), v.slice(2));
+  return path.resolve(v);
+}
+
+function convertAudioToMp3(inputPath: string, outPath: string): void {
+  const bin = resolveFfmpegBinary();
+  const r = spawnSync(bin, ["-y", "-i", inputPath, "-vn", "-acodec", "libmp3lame", "-ar", "44100", "-b:a", "128k", outPath], {
+    stdio: "pipe",
+  });
+  if (r.status !== 0) {
+    throw new Error(`ffmpeg local audio convert failed (rc=${r.status}): ${r.stderr?.toString().slice(-300)}`);
   }
 }
 
@@ -321,6 +375,9 @@ export async function synthesizeScene(
   options: TtsOptions = {}
 ): Promise<TtsResult> {
   const provider = resolveTtsProvider();
+  if (provider === "local-mp3") {
+    throw new Error("TTS_PROVIDER=local-mp3 requires Voice mode / TTS_MODE = single-shot. Per-scene local MP3 is not supported.");
+  }
   const fileName = `scene_${String(scene.index).padStart(3, "0")}.mp3`;
   const filePath = path.join(outDir, fileName);
 
@@ -343,6 +400,13 @@ export async function synthesizeFullScript(
 ): Promise<TtsResult> {
   const provider = resolveTtsProvider();
   log(runId, "info", `TTS full script (${provider}, ${text.length} chars)`, { stage: "tts" });
+
+  if (provider === "local-mp3") {
+    await localAudioTts(runId, outPath);
+    const durationSec = await probeDurationSafe(outPath);
+    log(runId, "success", `TTS full script done: ${path.basename(outPath)} (${durationSec.toFixed(1)}s)`, { stage: "tts" });
+    return { filePath: outPath, durationSec };
+  }
 
   const MAX_CHARS = 2500;
   const chunks = chunkAtSentences(text, MAX_CHARS);
