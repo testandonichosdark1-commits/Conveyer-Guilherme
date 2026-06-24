@@ -25,12 +25,13 @@ export const SETTING_KEYS = [
   "VIDEO_CONTEXT",           // optional short channel/setting hint injected into scene split and footage scoring
 
   // ── Text-to-Speech (ai33.pro / ElevenLabs / MiniMax) ──────────────
-  "TTS_PROVIDER",            // ai33pro | 69labs | kokoro | minimax | minimax-ai33pro
+  "TTS_PROVIDER",            // ai33pro | ai33pro-v3 | 69labs | kokoro | minimax | minimax-ai33pro | edge-ai33pro | local-mp3
   "LABS69_API_KEY",          // 69labs API key
   "MINIMAX_API_KEY",         // MiniMax direct T2A API key
   "MINIMAX_GROUP_ID",        // MiniMax GroupId
   "MINIMAX_MODEL",           // MiniMax TTS model, e.g. speech-02-hd
   "AI33PRO_POLL_MAX_MINUTES", // max minutes to wait for one ai33.pro TTS task before timing out
+  "TTS_LOCAL_AUDIO_PATH",    // local MP3/WAV/M4A voiceover path used when TTS_PROVIDER=local-mp3
   "TTS_VOICE_PROVIDER",      // 69labs path only: elevenlabs | edgetts | voice-clone
   "TTS_VOICE_ID",            // narration voice id/name
   "TTS_MODEL",               // ElevenLabs model, e.g. eleven_multilingual_v2
@@ -193,6 +194,7 @@ export const DEFAULTS: Record<SettingKey, string> = {
   MINIMAX_GROUP_ID: "",
   MINIMAX_MODEL: "speech-02-hd",
   AI33PRO_POLL_MAX_MINUTES: "45",
+  TTS_LOCAL_AUDIO_PATH: "",
   TTS_VOICE_PROVIDER: "elevenlabs",
   TTS_VOICE_ID: "",
   TTS_MODEL: "eleven_multilingual_v2",
