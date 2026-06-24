@@ -116,11 +116,13 @@ interface PexelsPhotoSearchResponse {
 export interface RunStats {
   pexelsCalls: number;
   pixabayCalls: number;
+  coverrCalls: number;
   geminiVisionCalls: number;
   cacheHits: number;
   cacheMisses: number;
   pexels429s: number;
   pixabay429s: number;
+  coverr429s: number;
   geminiVision429s: number;
   assetsReusedFromCache: number;
 }
@@ -133,11 +135,13 @@ export function getOrCreateStats(runId: string): RunStats {
     stats = {
       pexelsCalls: 0,
       pixabayCalls: 0,
+      coverrCalls: 0,
       geminiVisionCalls: 0,
       cacheHits: 0,
       cacheMisses: 0,
       pexels429s: 0,
       pixabay429s: 0,
+      coverr429s: 0,
       geminiVision429s: 0,
       assetsReusedFromCache: 0,
     };
@@ -212,6 +216,11 @@ function deserializeHit(sh: any, runId: string): FootageHit {
       } else if (sh.source === "pixabay") {
         if (sh.downloadUrl) {
           return downloadUrlToFile(sh.downloadUrl, out, runId);
+        }
+      } else if (sh.source === "coverr") {
+        if (sh.coverrBaseFilename) {
+          const signedUrl = await coverrSignedVideoUrl(sh.coverrBaseFilename, runId);
+          return downloadUrlToFile(signedUrl, out, runId);
         }
       }
       throw new Error(`Cannot download cached hit ${sh.dedupeId}: missing download payload`);
@@ -877,7 +886,7 @@ const FOOTAGE_UA = "ConveyerGuilherme/1.0 (local video tool)";
 /** A normalized candidate from any source, with everything needed to score,
  *  dedupe, log and download it. `desc` is free text used for relevance. */
 interface FootageHit {
-  source: string;       // "pexels" | "pixabay"
+  source: string;       // "pexels" | "pixabay" | "coverr"
   dedupeId: string;     // cross-source unique id, e.g. "pexels:123" / "pixabay:45"
   desc: string;         // slug / alt / tags — used by the text fallback scorer
   thumbUrl: string;     // small preview image — what the VISION scorer actually looks at ("" if none)
@@ -888,12 +897,13 @@ interface FootageHit {
   pexelsVideoFile?: any;
   pexelsPhotoUrl?: string;
   downloadUrl?: string;
+  coverrBaseFilename?: string;
 }
 
 /** Which libraries to query, in order. Default Pexels + Pixabay. */
 function configuredFootageSources(): string[] {
   const raw = getSetting("FOOTAGE_SOURCES") || "pexels,pixabay";
-  const known = new Set(["pexels", "pixabay"]);
+  const known = new Set(["pexels", "pixabay", "coverr"]);
   const list = raw
     .split(/[\n,;]+/)
     .map((s) => s.trim().toLowerCase())
@@ -1121,6 +1131,130 @@ async function pixabayPhotoHits(
   return hits;
 }
 
+// ── Coverr → FootageHit builders (video only) ────────────────────────────────
+//
+// Coverr API: https://api.coverr.co/
+// Search endpoint returns video objects with base_filename/full_image_path.
+// Storage endpoint returns a signed MP4 URL valid for a short time.
+
+interface CoverrVideo {
+  id?: number | string;
+  base_filename?: string;
+  title?: string;
+  name?: string;
+  description?: string;
+  full_image_path?: string;
+  contributor_name?: string | null;
+  contributor_url?: string | null;
+  is_vertical?: boolean;
+}
+
+function coverrApiKey(): string {
+  return getSetting("COVERR_API_KEY").trim();
+}
+
+function coverrAuthVariants(key: string): Record<string, string>[] {
+  // Coverr documentation has exposed its API through slightly different
+  // rendered views over time, so try safe common API-key header variants.
+  return [
+    { Authorization: `Bearer ${key}` },
+    { "x-api-key": key },
+    { "api-key": key },
+    { apikey: key },
+  ];
+}
+
+async function coverrFetchJson(url: URL | string, runId: string): Promise<any> {
+  const key = coverrApiKey();
+  if (!key) return null;
+
+  let lastErr = "";
+  for (const headers of coverrAuthVariants(key)) {
+    if (runId) getOrCreateStats(runId).coverrCalls++;
+    const resp = await fetch(url, { headers: { ...headers, "User-Agent": FOOTAGE_UA, Accept: "application/json" } });
+    if (resp.status === 401 || resp.status === 403) {
+      lastErr = `Coverr auth HTTP ${resp.status}: ${(await resp.text()).slice(0, 200)}`;
+      continue;
+    }
+    if (resp.status === 429) {
+      if (runId) getOrCreateStats(runId).coverr429s++;
+      throw new Error("Coverr HTTP 429");
+    }
+    if (!resp.ok) throw new Error(`Coverr HTTP ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
+    return await resp.json();
+  }
+  throw new Error(lastErr || "Coverr auth failed");
+}
+
+function coverrListFromResponse(data: any): CoverrVideo[] {
+  if (Array.isArray(data)) return data;
+  if (Array.isArray(data?.data)) return data.data;
+  if (Array.isArray(data?.videos)) return data.videos;
+  if (Array.isArray(data?.results)) return data.results;
+  return [];
+}
+
+async function coverrSignedVideoUrl(baseFilename: string, runId: string): Promise<string> {
+  const url = new URL(`https://api.coverr.co/storage/videos/${encodeURIComponent(baseFilename)}`);
+  const data = await coverrFetchJson(url, runId);
+  if (typeof data === "string") return data;
+  const signed =
+    data?.url ||
+    data?.signed_url ||
+    data?.signedUrl ||
+    data?.download_url ||
+    data?.downloadUrl ||
+    data?.mp4 ||
+    data?.data?.url ||
+    data?.data?.signed_url ||
+    data?.data?.download_url;
+  if (!signed || typeof signed !== "string") {
+    throw new Error(`Coverr signed URL missing for ${baseFilename}`);
+  }
+  return signed;
+}
+
+async function coverrVideoHits(
+  query: string,
+  opts: { orientation: Orientation; runId: string }
+): Promise<FootageHit[]> {
+  if (!coverrApiKey()) return [];
+
+  const url = new URL("https://api.coverr.co/search/videos");
+  url.searchParams.set("query", query.slice(0, 100));
+
+  const data = await coverrFetchJson(url, opts.runId);
+  const videos = coverrListFromResponse(data);
+  const hits: FootageHit[] = [];
+
+  for (const v of videos) {
+    const base = v.base_filename;
+    if (!base) continue;
+    const vertical = Boolean(v.is_vertical);
+    if (opts.orientation === "portrait" && !vertical) continue;
+    if (opts.orientation === "landscape" && vertical) continue;
+
+    const id = v.id ?? base;
+    const desc = `${v.title || ""} ${v.name || ""} ${v.description || ""}`.trim();
+    hits.push({
+      source: "coverr",
+      dedupeId: `coverr:${id}`,
+      desc,
+      thumbUrl: v.full_image_path || "",
+      author: v.contributor_name || null,
+      sourceUrl: `https://coverr.co/videos/${base}`,
+      meta: vertical ? "coverr vertical video" : "coverr video",
+      coverrBaseFilename: base,
+      download: async (out) => {
+        const signedUrl = await coverrSignedVideoUrl(base, opts.runId);
+        return downloadUrlToFile(signedUrl, out, opts.runId);
+      },
+    });
+  }
+
+  return hits;
+}
+
 /** Query EVERY configured source for one query, pool the normalized hits.
  *  A source that errors is logged and skipped (never fails the whole gather). */
 async function gatherHits(
@@ -1165,6 +1299,11 @@ async function gatherHits(
         log(opts.runId, "debug", `Pixabay search skipped (suspended due to rate limit): "${query}"`, { stage: "animate" });
         return [];
       }
+    } else if (src === "coverr") {
+      if (!coverrApiKey()) {
+        log(opts.runId, "debug", `Coverr search skipped — COVERR_API_KEY is empty`, { stage: "animate" });
+        return [];
+      }
     }
 
     // 3. API Call on Cache Miss
@@ -1179,6 +1318,10 @@ async function gatherHits(
         hits = kind === "video"
           ? await pixabayVideoHits(query, { orientation: opts.orientation, minDuration: opts.minDuration, runId: opts.runId })
           : await pixabayPhotoHits(query, { orientation: opts.orientation, runId: opts.runId });
+      } else if (src === "coverr") {
+        hits = kind === "video"
+          ? await coverrVideoHits(query, { orientation: opts.orientation, runId: opts.runId })
+          : [];
       }
 
       // 4. Save to Search Cache if hits found
@@ -1194,6 +1337,7 @@ async function gatherHits(
           pexelsVideoFile: h.pexelsVideoFile,
           pexelsPhotoUrl: h.pexelsPhotoUrl,
           downloadUrl: h.downloadUrl,
+          coverrBaseFilename: h.coverrBaseFilename,
         }));
         try {
           insertSearchCacheStmt.run(cacheKey, JSON.stringify(serializable), Date.now());

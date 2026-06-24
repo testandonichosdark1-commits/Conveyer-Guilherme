@@ -46,6 +46,12 @@ export const ALL_GROUPS: Group[] = [
         examples: "Get it at https://pixabay.com/api/docs/",
       },
       {
+        key: "COVERR_API_KEY",
+        label: "Coverr API key (optional)",
+        desc: "Optional Coverr API key. When set and included in Footage sources, the app searches Coverr for extra stock video candidates.",
+        examples: "Get it at https://coverr.co/developers",
+      },
+      {
         key: "GROQ_API_KEY",
         label: "Groq API key (Whisper alignment)",
         desc: "Used in single-shot voice mode to align the continuous voiceover to scene boundaries with word timestamps.",
@@ -251,7 +257,7 @@ export const ALL_GROUPS: Group[] = [
     ],
   },
   {
-    title: "Stock Footage (Pexels/Pixabay)",
+    title: "Stock Footage (Pexels/Pixabay/Coverr)",
     subtitle: "How the app searches and picks stock video/photo b-roll.",
     fields: [
       {
@@ -266,7 +272,7 @@ export const ALL_GROUPS: Group[] = [
         key: "FOOTAGE_SOURCES",
         label: "Footage sources",
         desc: "Comma-separated stock libraries to search.",
-        examples: "pexels,pixabay · pexels",
+        examples: "pexels,pixabay,coverr · pexels,pixabay · pexels",
       },
       {
         key: "FOOTAGE_AI_PICK",

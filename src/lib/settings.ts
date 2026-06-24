@@ -9,6 +9,7 @@ export const SETTING_KEYS = [
   "GOOGLE_API_KEY",          // Gemini — scene splitting and Gemini Vision scoring
   "PEXELS_API_KEY",          // Pexels — stock b-roll
   "PIXABAY_API_KEY",         // Pixabay — second stock source (video+photo). Optional; empty = Pexels only.
+  "COVERR_API_KEY",         // Coverr — optional third stock video source.
   "AI33PRO_API_KEY",         // ai33.pro — ElevenLabs voices proxy
   "GROQ_API_KEY",            // Groq Whisper — word-level transcription for single-shot voiceover mode
 
@@ -172,6 +173,7 @@ export const DEFAULTS: Record<SettingKey, string> = {
   GOOGLE_API_KEY: "",
   PEXELS_API_KEY: "",
   PIXABAY_API_KEY: "",
+  COVERR_API_KEY: "",
   AI33PRO_API_KEY: "",
   GROQ_API_KEY: "",
 
