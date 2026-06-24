@@ -107,13 +107,13 @@ export const ALL_GROUPS: Group[] = [
       {
         key: "TTS_PROVIDER",
         label: "Voice engine",
-        desc: "Voice engine used for narration.",
-        examples: "ai33pro · 69labs · kokoro · minimax · minimax-ai33pro · edge-ai33pro",
+        desc: "Voice engine used for narration. Use local-mp3 to provide a finished MP3 voiceover manually.",
+        examples: "local-mp3 · ai33pro-v3 · ai33pro · 69labs · kokoro · minimax · minimax-ai33pro · edge-ai33pro",
       },
       {
         key: "AI33PRO_API_KEY",
         label: "ai33.pro key",
-        desc: "ai33.pro API key. Used for ai33pro, kokoro, minimax-ai33pro, and edge-ai33pro engines.",
+        desc: "ai33.pro API key. Used for ai33pro, ai33pro-v3, kokoro, minimax-ai33pro, and edge-ai33pro engines.",
         examples: "Paste locally only; never commit API keys.",
       },
       {
@@ -121,6 +121,12 @@ export const ALL_GROUPS: Group[] = [
         label: "ai33.pro task timeout (minutes)",
         desc: "Maximum time to wait for one ai33.pro TTS task before aborting. Useful when MiniMax/ai33.pro takes longer than normal.",
         examples: "45 default · 60 safer for slow MiniMax jobs · 90 very patient",
+      },
+      {
+        key: "TTS_LOCAL_AUDIO_PATH",
+        label: "Local MP3 voiceover path",
+        desc: "Absolute path to a finished full-script narration file. Used only when Voice engine is local-mp3. Best with Voice mode = single-shot.",
+        examples: "Mac: /Users/you/Desktop/voiceover.mp3 · supports ~/Desktop/voiceover.mp3",
       },
       {
         key: "LABS69_API_KEY",
@@ -149,7 +155,7 @@ export const ALL_GROUPS: Group[] = [
       {
         key: "TTS_MODE",
         label: "Voice mode",
-        desc: "single-shot records one continuous voiceover and aligns it with Whisper. per-scene records each scene separately.",
+        desc: "single-shot records one continuous voiceover and aligns it with Whisper. local-mp3 requires single-shot.",
         examples: "single-shot · per-scene",
       },
       {
