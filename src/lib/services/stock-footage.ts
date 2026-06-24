@@ -1154,16 +1154,32 @@ function coverrApiKey(): string {
 }
 
 function coverrAuthVariants(key: string): Record<string, string>[] {
-  // Coverr's public docs show a simple /videos curl, and the authenticated
-  // dashboard may accept different API-key headers. Try no-auth first, then
-  // common API-key header variants.
+  // Demo Coverr apps are free, but the rendered docs do not expose one stable
+  // auth shape. Try no-auth first, then common header variants, including
+  // the literal API_KEY form returned by Coverr error messages.
   return [
     {},
-    { Authorization: `Bearer ${key}` },
+    { API_KEY: key },
+    { "API-KEY": key },
     { "x-api-key": key },
     { "api-key": key },
     { apikey: key },
+    { Authorization: `Bearer ${key}` },
   ];
+}
+
+function coverrUrlAuthVariants(url: URL, key: string): URL[] {
+  // Some Coverr deployments expect the API key as a query parameter instead
+  // of a header. Keep no-query first so public/free endpoints still work.
+  if (!key) return [url];
+
+  const variants: URL[] = [url];
+  for (const param of ["API_KEY", "api_key", "apikey", "key"]) {
+    const u = new URL(url.toString());
+    u.searchParams.set(param, key);
+    variants.push(u);
+  }
+  return variants;
 }
 
 async function coverrFetchJson(url: URL | string, runId: string): Promise<any> {
@@ -1171,19 +1187,22 @@ async function coverrFetchJson(url: URL | string, runId: string): Promise<any> {
   if (!key) return null;
 
   let lastErr = "";
-  for (const headers of coverrAuthVariants(key)) {
-    if (runId) getOrCreateStats(runId).coverrCalls++;
-    const resp = await fetch(url, { headers: { ...headers, "User-Agent": FOOTAGE_UA, Accept: "application/json" } });
-    if (resp.status === 401 || resp.status === 403) {
-      lastErr = `Coverr auth HTTP ${resp.status}: ${(await resp.text()).slice(0, 200)}`;
-      continue;
+  const baseUrl = typeof url === "string" ? new URL(url) : url;
+  for (const u of coverrUrlAuthVariants(baseUrl, key)) {
+    for (const headers of coverrAuthVariants(key)) {
+      if (runId) getOrCreateStats(runId).coverrCalls++;
+      const resp = await fetch(u, { headers: { ...headers, "User-Agent": FOOTAGE_UA, Accept: "application/json" } });
+      if (resp.status === 401 || resp.status === 403) {
+        lastErr = `Coverr auth HTTP ${resp.status}: ${(await resp.text()).slice(0, 200)}`;
+        continue;
+      }
+      if (resp.status === 429) {
+        if (runId) getOrCreateStats(runId).coverr429s++;
+        throw new Error("Coverr HTTP 429");
+      }
+      if (!resp.ok) throw new Error(`Coverr HTTP ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
+      return await resp.json();
     }
-    if (resp.status === 429) {
-      if (runId) getOrCreateStats(runId).coverr429s++;
-      throw new Error("Coverr HTTP 429");
-    }
-    if (!resp.ok) throw new Error(`Coverr HTTP ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
-    return await resp.json();
   }
   throw new Error(lastErr || "Coverr auth failed");
 }
