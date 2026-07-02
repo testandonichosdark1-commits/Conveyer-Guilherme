@@ -689,6 +689,94 @@ function candidateHasGenericVisual(candTokens: string[]): boolean {
   return candTokens.some((t) => OPENING_GENERIC_VISUAL_TERMS.has(stemWord(t)) || OPENING_GENERIC_VISUAL_TERMS.has(t));
 }
 
+function splitCommaSetting(key: string): string[] {
+  return (getSetting(key as any) || "")
+    .split(/[\n,;]+/)
+    .map((x) => x.trim())
+    .filter(Boolean);
+}
+
+function settingTokens(key: string): string[] {
+  return [...new Set(splitCommaSetting(key).flatMap((x) => relevanceTokens(x)).map(stemWord))];
+}
+
+function openingLockStrength(): "off" | "balanced" | "strict" {
+  const raw = (getSetting("OPENING_TOPIC_LOCK_STRENGTH" as any) || "strict").trim().toLowerCase();
+  if (raw === "off" || raw === "none" || raw === "false") return "off";
+  if (raw === "balanced" || raw === "soft" || raw === "normal") return "balanced";
+  return "strict";
+}
+
+const OPENING_WEAK_ANCHOR_TERMS = new Set([
+  // Too broad: these create false positives like skateboards, foam rolls, offices, etc.
+  "wood", "wooden", "white", "gray", "grey", "damp", "wet", "dry", "hand", "hands",
+  "person", "people", "man", "woman", "close", "closeup", "shot", "view", "storage",
+  "prevention", "method", "trick", "thing", "stuff", "material", "surface", "room",
+  "borax", "lime", "whitewash", "mold", "sour", "smell"
+]);
+
+function openingBlockedVisualTokens(): string[] {
+  return [
+    ...settingTokens("OPENING_BLOCKED_VISUAL_TERMS"),
+    ...[...OPENING_GENERIC_VISUAL_TERMS].map(stemWord),
+  ];
+}
+
+function candidateMatchesTokenSet(candTokens: string[], tokens: string[]): boolean {
+  if (tokens.length === 0) return false;
+  return tokens.some((term) => candTokens.some((ct) => tokensMatch(ct, term)));
+}
+
+function openingRequiredVisualAnchors(
+  openingAnchors: string[],
+  videoContext: string,
+  scene: Scene,
+  strict: boolean
+): string[] {
+  const manual = settingTokens("OPENING_REQUIRED_VISUAL_ANCHORS");
+  if (manual.length > 0) return manual;
+  if (!strict) return openingAnchors;
+
+  // In strict mode, infer anchors from the context/queries, but remove weak terms
+  // that often pull random b-roll. Users can override with OPENING_REQUIRED_VISUAL_ANCHORS.
+  const raw = [
+    videoContext,
+    scene.visual_prompt || "",
+    ...(scene.visual_queries || []),
+    ...(scene.fallback_queries || []),
+    ...openingAnchors,
+  ].join(" ");
+
+  const inferred = relevanceTokens(raw)
+    .map(stemWord)
+    .filter((t) => t.length >= 3 && !OPENING_WEAK_ANCHOR_TERMS.has(t));
+
+  return [...new Set(inferred)].slice(0, 24);
+}
+
+function openingRequiredVisualPhrases(): string[] {
+  return splitCommaSetting("OPENING_REQUIRED_VISUAL_ANCHORS");
+}
+
+function strengthenOpeningQueries(baseQueries: string[], requiredAnchors: string[], videoContext: string): string[] {
+  const manualPhrases = openingRequiredVisualPhrases();
+  const phraseParts = manualPhrases.length > 0 ? manualPhrases : requiredAnchors;
+  const anchorPhrase = phraseParts.slice(0, 6).join(" ").trim();
+  if (!anchorPhrase) return baseQueries;
+
+  const contextFallback = visualPromptToQuery(`${videoContext} ${anchorPhrase}`, 12);
+  const out: string[] = [];
+  if (contextFallback) out.push(contextFallback);
+
+  for (const q of baseQueries.slice(0, 6)) {
+    out.push(visualPromptToQuery(`${q} ${anchorPhrase}`, 12));
+    out.push(visualPromptToQuery(`${anchorPhrase} ${q}`, 12));
+  }
+
+  out.push(...baseQueries);
+  return [...new Set(out.filter(Boolean))].slice(0, 18);
+}
+
 function sceneAvoidTokens(scene: Scene): string[] {
   const avoid = Array.isArray(scene.avoid) ? scene.avoid : [];
   return [...new Set(avoid.flatMap((x) => relevanceTokens(String(x))).map(stemWord))];
@@ -1182,27 +1270,39 @@ function coverrUrlAuthVariants(url: URL, key: string): URL[] {
   return variants;
 }
 
+function coverrAuthRequests(baseUrl: URL, key: string): { url: URL; headers: Record<string, string> }[] {
+  const requests: { url: URL; headers: Record<string, string> }[] = [];
+  // Header-only variants.
+  for (const headers of coverrAuthVariants(key)) {
+    requests.push({ url: new URL(baseUrl.toString()), headers });
+  }
+  // Query-only variants. Do NOT also send key headers, otherwise Coverr returns:
+  // "API Key MUST NOT be provided in more than one place".
+  for (const u of coverrUrlAuthVariants(baseUrl, key).slice(1)) {
+    requests.push({ url: u, headers: {} });
+  }
+  return requests;
+}
+
 async function coverrFetchJson(url: URL | string, runId: string): Promise<any> {
   const key = coverrApiKey();
   if (!key) return null;
 
   let lastErr = "";
   const baseUrl = typeof url === "string" ? new URL(url) : url;
-  for (const u of coverrUrlAuthVariants(baseUrl, key)) {
-    for (const headers of coverrAuthVariants(key)) {
-      if (runId) getOrCreateStats(runId).coverrCalls++;
-      const resp = await fetch(u, { headers: { ...headers, "User-Agent": FOOTAGE_UA, Accept: "application/json" } });
-      if (resp.status === 401 || resp.status === 403) {
-        lastErr = `Coverr auth HTTP ${resp.status}: ${(await resp.text()).slice(0, 200)}`;
-        continue;
-      }
-      if (resp.status === 429) {
-        if (runId) getOrCreateStats(runId).coverr429s++;
-        throw new Error("Coverr HTTP 429");
-      }
-      if (!resp.ok) throw new Error(`Coverr HTTP ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
-      return await resp.json();
+  for (const req of coverrAuthRequests(baseUrl, key)) {
+    if (runId) getOrCreateStats(runId).coverrCalls++;
+    const resp = await fetch(req.url, { headers: { ...req.headers, "User-Agent": FOOTAGE_UA, Accept: "application/json" } });
+    if (resp.status === 401 || resp.status === 403) {
+      lastErr = `Coverr auth HTTP ${resp.status}: ${(await resp.text()).slice(0, 200)}`;
+      continue;
     }
+    if (resp.status === 429) {
+      if (runId) getOrCreateStats(runId).coverr429s++;
+      throw new Error("Coverr HTTP 429");
+    }
+    if (!resp.ok) throw new Error(`Coverr HTTP ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
+    return await resp.json();
   }
   throw new Error(lastErr || "Coverr auth failed");
 }
@@ -1675,6 +1775,7 @@ interface PoolHit {
   openingAnchorMatch?: boolean;
   openingGeneric?: boolean;
   avoidMatch?: boolean;
+  openingBlockedMatch?: boolean;
 }
 
 /**
@@ -1715,18 +1816,28 @@ async function acquireFootage(
   } = options;
   const gatherOpts = { runId, orientation, maxHeight, minDuration };
 
-  const baseQueries = sceneQueryCandidates(scene);
+  const rawBaseQueries = sceneQueryCandidates(scene);
+  const openingStrength = openingLockStrength();
+  const strictOpeningLock = openingTopicLock && openingStrength === "strict";
+  const balancedOpeningLock = openingTopicLock && openingStrength === "balanced";
+  const rawOpeningAnchors = openingTopicLock ? openingTopicAnchors(scene, videoContext, anchorWords) : [];
+  const effectiveOpeningAnchors = openingTopicLock
+    ? openingRequiredVisualAnchors(rawOpeningAnchors, videoContext, scene, strictOpeningLock)
+    : [];
+  const baseQueries = strictOpeningLock
+    ? strengthenOpeningQueries(rawBaseQueries, effectiveOpeningAnchors, videoContext)
+    : rawBaseQueries;
   if (baseQueries.length === 0) {
     throw new Error(`Scene #${scene.index}: empty query (no visual_queries)`);
   }
   const queryTokenLists = baseQueries.map(relevanceTokens);
-  const openingAnchors = openingTopicLock ? openingTopicAnchors(scene, videoContext, anchorWords) : [];
   const avoidTokens = sceneAvoidTokens(scene);
-  if (openingTopicLock) {
+  const blockedOpeningTokens = strictOpeningLock ? openingBlockedVisualTokens() : [];
+  if (openingTopicLock && openingStrength !== "off") {
     log(
       runId,
       "debug",
-      `Opening Topic Lock active for scene #${scene.index} (${openingAnchors.slice(0, 8).join(", ") || "no anchors"})`,
+      `Opening Topic Lock ${strictOpeningLock ? "STRICT" : "active"} for scene #${scene.index} (${effectiveOpeningAnchors.slice(0, 8).join(", ") || "no anchors"})`,
       { stage: "animate" }
     );
   }
@@ -1748,6 +1859,7 @@ async function acquireFootage(
       if (
         !ignoreAvoidList &&
         openingTopicLock &&
+        openingStrength !== "off" &&
         s.openingGeneric &&
         !s.openingAnchorMatch
       ) {
@@ -1757,6 +1869,22 @@ async function acquireFootage(
           `Opening Topic Lock skipped generic off-topic asset: ${s.hit.dedupeId} (${s.hit.desc.slice(0, 80) || "no description"})`,
           { stage: "animate" }
         );
+        continue;
+      }
+
+      if (!ignoreAvoidList && strictOpeningLock && s.openingBlockedMatch) {
+        log(runId, "warn", `Strict Opening Lock blocked off-context asset: ${s.hit.dedupeId} (${s.hit.desc.slice(0, 80) || "no description"})`, { stage: "animate" });
+        continue;
+      }
+
+      if (
+        !ignoreAvoidList &&
+        strictOpeningLock &&
+        effectiveOpeningAnchors.length > 0 &&
+        !s.openingAnchorMatch &&
+        s.score < 0.8
+      ) {
+        log(runId, "warn", `Strict Opening Lock skipped asset with no required anchor: ${s.hit.dedupeId} (${s.hit.desc.slice(0, 80) || "no description"})`, { stage: "animate" });
         continue;
       }
 
@@ -1814,12 +1942,23 @@ async function acquireFootage(
     const localScored = hits
       .map((h) => {
         const candTokens = relevanceTokens(h.desc);
-        const openingAnchorMatch = openingTopicLock
-          ? candidateMatchesAnyAnchor(candTokens, openingAnchors)
+        const openingAnchorMatch = openingTopicLock && openingStrength !== "off"
+          ? candidateMatchesAnyAnchor(candTokens, effectiveOpeningAnchors)
           : true;
-        const openingGeneric = openingTopicLock ? candidateHasGenericVisual(candTokens) : false;
+        const openingGeneric = openingTopicLock && openingStrength !== "off" ? candidateHasGenericVisual(candTokens) : false;
         const avoidMatch = candidateMatchesAvoid(candTokens, avoidTokens);
+        const openingBlockedMatch = strictOpeningLock ? candidateMatchesTokenSet(candTokens, blockedOpeningTokens) : false;
         let local = relevanceScore(candTokens, queryTokenLists, anchorWords);
+
+        if (strictOpeningLock) {
+          if (openingBlockedMatch) {
+            local = 0;
+          } else if (effectiveOpeningAnchors.length > 0 && openingAnchorMatch) {
+            local = Math.min(1, local * 1.25 + 0.1);
+          } else if (effectiveOpeningAnchors.length > 0 && !openingAnchorMatch) {
+            local *= 0.05;
+          }
+        }
 
         if (avoidMatch && !openingAnchorMatch) {
           local *= 0.1;
@@ -1827,14 +1966,14 @@ async function acquireFootage(
           local *= 0.55;
         }
 
-        if (openingTopicLock && openingAnchors.length > 0 && !openingAnchorMatch) {
+        if (openingTopicLock && rawOpeningAnchors.length > 0 && !openingAnchorMatch) {
           // In the opening hook, a generic store/trash/paper/etc. clip should not
           // beat a weaker but topical clip. Still keep a tiny score so the scene
           // can fall back if absolutely nothing on-topic exists.
           local *= openingGeneric ? 0.02 : 0.2;
         }
 
-        return { hit: h, local, openingAnchorMatch, openingGeneric, avoidMatch };
+        return { hit: h, local, openingAnchorMatch, openingGeneric, avoidMatch, openingBlockedMatch };
       })
       .sort((a, b) => b.local - a.local);
 
@@ -1844,7 +1983,10 @@ async function acquireFootage(
       if (avoidDedupeIds && avoidDedupeIds.has(x.hit.dedupeId)) {
         return false;
       }
-      if (openingTopicLock && x.openingGeneric && !x.openingAnchorMatch) {
+      if (openingTopicLock && openingStrength !== "off" && x.openingGeneric && !x.openingAnchorMatch) {
+        return false;
+      }
+      if (strictOpeningLock && x.openingBlockedMatch) {
         return false;
       }
       return x.local > 0; // Don't send completely bad matches to Vision
@@ -1858,13 +2000,16 @@ async function acquireFootage(
     const visLimit = Math.max(1, Number(getSetting("VISION_CANDIDATE_LIMIT") || "8"));
     const toScore = candidatesToScore.slice(0, visLimit).map((x) => x.hit);
 
-    const vision = await aiScoreHitsByVision(runId, scene.text, videoContext, toScore, openingTopicLock, openingAnchors);
+    const vision = await aiScoreHitsByVision(runId, scene.text, videoContext, toScore, openingTopicLock && openingStrength !== "off", effectiveOpeningAnchors);
     for (const x of localScored) {
       const v = vision?.get(x.hit.dedupeId);
       let score = v !== undefined ? v : x.local;
 
-      if (openingTopicLock && openingAnchors.length > 0 && !x.openingAnchorMatch) {
-        score = Math.min(score, x.openingGeneric ? 0.15 : 0.35);
+      if (strictOpeningLock && x.openingBlockedMatch) {
+        score = 0;
+      }
+      if (openingTopicLock && openingStrength !== "off" && effectiveOpeningAnchors.length > 0 && !x.openingAnchorMatch) {
+        score = strictOpeningLock ? Math.min(score, 0.2) : Math.min(score, x.openingGeneric ? 0.15 : 0.35);
       }
       if (x.avoidMatch && !x.openingAnchorMatch) {
         score = Math.min(score, 0.15);
@@ -1878,6 +2023,7 @@ async function acquireFootage(
         openingAnchorMatch: x.openingAnchorMatch,
         openingGeneric: x.openingGeneric,
         avoidMatch: x.avoidMatch,
+        openingBlockedMatch: x.openingBlockedMatch,
       });
     }
     pool.sort((a, b) => b.score - a.score);
@@ -1930,7 +2076,7 @@ async function acquireFootage(
     log(runId, "warn", `Scene #${scene.index}: Opening Topic Lock found no anchored asset. Using best available only as last resort.`, {
       stage: "animate",
     });
-    const got = await tryList(pool, true);
+    const got = await tryList(pool, strictOpeningLock ? false : true);
     if (got) return got;
   }
 
